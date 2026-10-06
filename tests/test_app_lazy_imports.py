@@ -32,7 +32,8 @@ _CHILD = r'''
 import json, sys
 import pet.app  # noqa: F401 - 被测：只导入入口模块，不起 QApplication
 deferred = ["pet.balance", "pet.festival_service", "pet.festival_data",
-            "pet.festival_quotes_cn", "pet.festival_quotes_west_movie"]
+            "pet.festival_quotes_cn", "pet.festival_quotes_west_movie",
+            "pet.web_watch.service", "pet.web_watch.server", "pet.web_watch.policy"]
 print(json.dumps({name: name in sys.modules for name in deferred}))
 '''
 
@@ -64,4 +65,21 @@ def test_importing_app_defers_festival_modules():
     ) if loaded[name]]
     assert not offenders, (
         f'节日提醒总开关默认关闭，这些模块不该在 import pet.app 时载入: {offenders}'
+    )
+
+
+def test_importing_app_defers_web_watch_modules():
+    """Edge 网页互动总开关默认关闭：接收端/策略/摘要不得在 import pet.app 时常驻。
+
+    守护的是"关闭即零开销"这条口径——服务模块只在
+    ``AppShell._ensure_web_watch_service`` 里函数级 import；一旦有人把它提到
+    app.py 顶层，端口虽仍不会绑，但整个 web_watch 包（含 http.server 依赖图）
+    会白白常驻，且与 tests/test_feature_gating.py 的懒创建口径冲突。
+    """
+    loaded = _run_child()
+    offenders = [name for name in (
+        'pet.web_watch.service', 'pet.web_watch.server', 'pet.web_watch.policy',
+    ) if loaded[name]]
+    assert not offenders, (
+        f'网页互动默认关闭，这些模块不该在 import pet.app 时载入: {offenders}'
     )

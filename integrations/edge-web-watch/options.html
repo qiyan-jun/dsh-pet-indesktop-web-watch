@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>大肥鱼桌宠 · 网页互动设置</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 14px/1.6 system-ui, "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; max-width: 640px; }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      p.hint { color: #888; margin: 0 0 20px; }
+      label { display: block; margin: 14px 0 4px; font-weight: 600; }
+      input[type="text"], input[type="number"], textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #bbb; border-radius: 6px; font: inherit; }
+      textarea { min-height: 72px; }
+      .row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+      .row input { width: auto; }
+      .actions { margin-top: 22px; display: flex; gap: 10px; align-items: center; }
+      button { padding: 8px 16px; border-radius: 6px; border: 1px solid #888; background: #f5f5f5; font: inherit; cursor: pointer; }
+      button.primary { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+      #status { margin-left: 4px; color: #666; }
+      #status.ok { color: #1a7f37; }
+      #status.bad { color: #c0392b; }
+      code { background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>大肥鱼桌宠 · 网页互动</h1>
+    <p class="hint">
+      事件只发往本机 <code>127.0.0.1</code>，由你电脑上的桌宠接收；除你自己配置的模型服务商外，
+      不会发往任何第三方。含密码框的页面会被自动跳过。
+    </p>
+
+    <div class="row"><input type="checkbox" id="enabled" /><label for="enabled" style="margin:0">启用网页互动</label></div>
+
+    <label for="port">桌宠本地端口</label>
+    <input type="number" id="port" min="1" max="65535" step="1" />
+    <p class="hint" style="margin:4px 0 0">桌宠设置页「网页互动」里显示的端口，默认 8765。</p>
+
+    <label for="token">访问令牌</label>
+    <input type="text" id="token" spellcheck="false" placeholder="从桌宠设置页复制" />
+    <p class="hint" style="margin:4px 0 0">令牌是桌宠自动生成的，用于阻止别的程序/网页往桌宠里塞内容。</p>
+
+    <div class="row"><input type="checkbox" id="sendSelection" /><label for="sendSelection" style="margin:0">发送我选中的文字（划词时评论）</label></div>
+    <div class="row"><input type="checkbox" id="sendVideo" /><label for="sendVideo" style="margin:0">发送视频播放进度（看到关键时刻说一句）</label></div>
+
+    <label for="pausedDomains">这些网站不发送（一行一个域名）</label>
+    <textarea id="pausedDomains" spellcheck="false" placeholder="例如：&#10;mail.example.com&#10;bank.example"></textarea>
+
+    <div class="actions">
+      <button class="primary" id="save">保存</button>
+      <button id="test">测试连接</button>
+      <span id="status"></span>
+    </div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

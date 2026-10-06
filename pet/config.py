@@ -422,6 +422,54 @@ def _merge_file_interpret_data(raw: Any) -> dict:
     return result
 
 
+def _default_web_watch_data() -> dict:
+    """Edge 网页互动（web_watch）默认值；消费方 pet/web_watch/。
+
+    默认**全关**：这是"读取浏览器页面内容"的敏感能力，必须由用户显式开启
+    （与 proactive_screen 同一口径：主动打扰 + 读内容的能力不许默认打开）。
+    数值区间以 pet/web_watch/policy.py 的 DEFAULT_WEB_WATCH_CONFIG 为准，
+    这里保持同值，并由 tests/test_web_watch.py 的同步用例钉住两份常量一致。
+    """
+    return {
+        "enabled": False,
+        "dry_run": False,
+        "port": 8765,
+        "token": "",
+        "whitelist": [],
+        "blacklist": [],
+        "dwell_seconds": 8,
+        "content_delta_chars": 400,
+        "min_text_chars": 120,
+        "comment_enabled": True,
+        "require_idle": False,
+        "min_idle_seconds": 20,
+        # DSH agent 工作时是否闭嘴：默认否（实机修正——agent 几乎恒为 working，
+        # 默认静音会让"网页互动"在用户整段对话期间看起来是坏的）
+        "pause_when_agent_busy": False,
+        "selection_enabled": True,
+        "min_selection_chars": 4,
+        "video_enabled": True,
+        "video_first_moment_seconds": 20.0,
+        "suggest_enabled": True,
+        "suggest_min_dwell_seconds": 25.0,
+        "suggest_idle_seconds": 45.0,
+        "suggest_min_text_chars": 200,
+        "speak_enabled": False,
+        "cooldown_minutes": 2.0,
+        "daily_cap": 60,
+        "min_request_interval_seconds": 30,
+        "max_comment_chars": 40,
+        "excerpt_chars": 1200,
+    }
+
+
+def _merge_web_watch_data(raw: Any) -> dict:
+    result = _default_web_watch_data()
+    if isinstance(raw, dict):
+        result.update(raw)
+    return result
+
+
 def _default_chat_data():
     return {
         "enabled": True,
@@ -841,6 +889,9 @@ class Config:
             "proactive_screen": _default_proactive_screen_data(),
             "agent_link": _default_agent_link_data(),
             "file_interpret": _default_file_interpret_data(),
+            # Edge 网页互动（读页面内容 → 说评论/给建议）：默认关闭，见
+            # _default_web_watch_data() 的说明
+            "web_watch": _default_web_watch_data(),
             "chat_ui_style": "modern",  # modern / classic（仅聊天窗口保留双实现）
             "chat_follow_pet": False,  # 聊天窗口是否跟随桌宠移动
             "system_notifications_enabled": True,  # 对话完成/失败/需要授权时弹桌面系统通知
@@ -1147,6 +1198,8 @@ class Config:
             self.data["agent_link"] = _merge_agent_link_data(raw["agent_link"])
         if "file_interpret" in raw:
             self.data["file_interpret"] = _merge_file_interpret_data(raw["file_interpret"])
+        if "web_watch" in raw:
+            self.data["web_watch"] = _merge_web_watch_data(raw["web_watch"])
         self._migrate_click_sound_config(raw)
         self._migrate_decode_broker_config(raw)
         self.data["version"] = 4
@@ -1459,6 +1512,55 @@ class Config:
                 fi.get("progress_interval_seconds"), 15.0, 5.0, 120.0
             )
         self.data.update(_clean_collision_data(self.data))
+        # Edge 网页互动（web_watch）：嵌套键归一化，与 file_interpret 同规——
+        # 布尔走 _bool_or_default（手改成字符串 "false" 不得被 bool() 误开），
+        # 数值夹回消费端可用区间且脏值（"abc"）回退默认（否则设置页构造会
+        # 直接抛 ValueError 打死整页），名单只接受 list[str]，未认识的键随
+        # _merge_web_watch_data 保留（宽容策略同 agent_link）。
+        ww = self.data.get("web_watch")
+        if isinstance(ww, dict):
+            _ww_defaults = _default_web_watch_data()
+            for _flag in (
+                "enabled",
+                "dry_run",
+                "comment_enabled",
+                "require_idle",
+                "pause_when_agent_busy",
+                "selection_enabled",
+                "video_enabled",
+                "suggest_enabled",
+                "speak_enabled",
+            ):
+                ww[_flag] = _bool_or_default(ww.get(_flag), bool(_ww_defaults[_flag]))
+            for _num, (_low, _high) in {
+                "port": (0, 65535),
+                "dwell_seconds": (0, 600),
+                "content_delta_chars": (80, 20000),
+                "min_text_chars": (0, 5000),
+                "min_idle_seconds": (0, 3600),
+                "min_selection_chars": (1, 200),
+                "daily_cap": (1, 9999),
+                "min_request_interval_seconds": (30, 3600),
+                "max_comment_chars": (8, 200),
+                "excerpt_chars": (200, 6000),
+            }.items():
+                ww[_num] = int(_float_or_default(ww.get(_num), float(_ww_defaults[_num]), float(_low), float(_high)))
+            for _num, (_low, _high) in {
+                "cooldown_minutes": (0.5, 120.0),
+                "video_first_moment_seconds": (0.0, 3600.0),
+                "suggest_min_dwell_seconds": (0.0, 3600.0),
+                "suggest_idle_seconds": (0.0, 3600.0),
+            }.items():
+                ww[_num] = _float_or_default(ww.get(_num), float(_ww_defaults[_num]), float(_low), float(_high))
+            for _name in ("whitelist", "blacklist"):
+                _items = ww.get(_name)
+                ww[_name] = (
+                    [str(_item).strip() for _item in _items if str(_item).strip()]
+                    if isinstance(_items, (list, tuple))
+                    else []
+                )
+            if not isinstance(ww.get("token"), str):
+                ww["token"] = ""
 
     def get(self, key, default=None):
         return self.data.get(key, default)
@@ -1555,6 +1657,7 @@ class Config:
             "throw_strength",
             "agent_link",
             "file_interpret",
+            "web_watch",
             "idle_low_fps_enabled",
             "idle_low_fps_threshold",
             "media_prewarm",
@@ -1604,6 +1707,11 @@ class Config:
         from .config_domains import ProactiveConfig
 
         return ProactiveConfig.from_dict(self.data.get("proactive_screen", {}))
+
+    def web_watch_config(self):
+        from .config_domains import WebWatchConfig
+
+        return WebWatchConfig.from_dict(self.data.get("web_watch", {}))
 
     def collision_config(self):
         from .config_domains import CollisionConfig

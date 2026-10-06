@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>桌宠网页互动</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 13px/1.5 system-ui, "Microsoft YaHei", sans-serif; margin: 0; padding: 14px; width: 268px; }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      #status { color: #666; min-height: 34px; }
+      .row { display: flex; align-items: center; gap: 6px; margin: 10px 0; }
+      button { width: 100%; margin-top: 8px; padding: 7px 10px; border-radius: 6px; border: 1px solid #888; background: #f5f5f5; font: inherit; cursor: pointer; }
+      a { display: inline-block; margin-top: 10px; color: #2d6cdf; }
+    </style>
+  </head>
+  <body>
+    <h1>大肥鱼桌宠 · 网页互动</h1>
+    <div id="status">读取状态中…</div>
+    <div class="row"><input type="checkbox" id="pauseSite" /><label for="pauseSite" style="margin:0">本网站暂停发送</label></div>
+    <button id="snapshot">让桌宠现在就看看这页</button>
+    <a href="#" id="options">打开完整设置</a>
+    <script src="popup.js"></script>
+  </body>
+</html>

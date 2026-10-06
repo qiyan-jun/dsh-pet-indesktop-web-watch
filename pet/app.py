@@ -957,6 +957,8 @@ class PetInstance:
             shell._sync_todo_service()
             shell._sync_chime_service()
             shell._sync_festival_service()
+            # 网页互动：设置里开了就绑端口/起心跳，关了立刻释放（运行期开关同步生效）
+            shell._sync_web_watch_service()
             self._sync_animation_prewarm()
             self._refresh_chat_windows()
             _mac_set_dock_icon_visible(bool(self.config.get("show_dock_icon", True)))
@@ -1189,6 +1191,11 @@ class AppShell:
         self.festival_service = None
         if self._festival_wanted():
             self._ensure_festival_service()
+        # Edge 网页互动（web_watch）：进程级懒服务。默认关闭（"读浏览器页面内容"
+        # 属敏感能力，必须用户显式开启）→ 启动既不创建也不占端口；开启后由
+        # _sync_web_watch_service 创建。创建时机必须在 _shared 就绪之后（冒泡经
+        # 共享代理扇出到首个可见窗），故本处只置空、真正的装配在 start()。
+        self.web_watch_service = None
         # 4.4b：`experimental_single_process_spawn` 键删除——进程内多窗从
         # "实验开关"升格为**唯一**多宠形态（多进程多宠退役层已删除），
         # 原先依赖该 flag 快照的窗级逻辑（runtime 标记版本化、日志前缀、
@@ -1529,6 +1536,58 @@ class AppShell:
         # 故必须连带同步通道生命周期（关掉节日语音后若报时也关，通道应释放）。
         self._sync_chime_service()
 
+    # ------------------------------------------------------------ 功能门控（网页互动）
+    def _web_watch_wanted(self) -> bool:
+        """网页互动总开关（默认关闭：读浏览内容是敏感能力，须用户显式开启）。
+
+        防御式读取 ``config``：设置关闭路径（``_modern_settings_finished``）会遍历
+        一次各 ``_sync_*``，而既有回归用例用 ``AppShell.__new__`` 造壳（无 config）。
+        没有 config = 没有用户开启 = 门判假；绝不能因此打断设置关闭流程。
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        cfg = config.get("web_watch", {})
+        return bool(cfg.get("enabled", False)) if isinstance(cfg, dict) else False
+
+    def _web_watch_target(self):
+        """冒泡扇出面：共享代理只发首个可见窗（overlay 拓扑下 inst.win 恒为 None）。"""
+        shared = getattr(self, "_shared", None)
+        proxy = getattr(shared, "proxy", None)
+        if proxy is not None:
+            return proxy
+        return getattr(self, "instance", None)
+
+    def _agent_busy_for_web_watch(self) -> bool:
+        """DSH Agent 正在干活时不打扰（与主动识屏的"联动去重"同一意图）。"""
+        tracker = getattr(self, "_dsh_state_tracker", None)
+        return str(getattr(tracker, "current_state", "") or "").lower() in ("working", "thinking")
+
+    def _ensure_web_watch_service(self):
+        """懒创建网页互动服务（重模块收在构造点：关闭时零 import、零端口）。"""
+        if getattr(self, "web_watch_service", None) is None:
+            from .web_watch.service import WebWatchService
+
+            self.web_watch_service = WebWatchService(
+                self.config,
+                self._web_watch_target(),
+                on_speak=self.speak_self_talk,
+                on_agent_busy=self._agent_busy_for_web_watch,
+            )
+        return self.web_watch_service
+
+    def _sync_web_watch_service(self) -> None:
+        """按配置启停网页互动服务；关闭时释放服务对象（本地端口一并释放）。"""
+        if self._web_watch_wanted():
+            service = self._ensure_web_watch_service()
+            service.apply_config()  # 已在运行只刷参数；未运行会自绑端口
+        elif getattr(self, "web_watch_service", None) is not None:
+            try:
+                self.web_watch_service.stop()
+            except Exception:
+                logging.exception("停止网页互动服务失败")
+            self.web_watch_service = None
+
     # ------------------------------------------------------------ DSH 状态跟踪
     def _dsh_tracker_wanted(self) -> bool:
         """DSH 状态跟踪器的功能门：``agent_link.dsh``（默认关）。
@@ -1581,6 +1640,10 @@ class AppShell:
         self._sync_todo_service()
         self._sync_chime_service()
         self._sync_festival_service()
+        # 网页互动同理：独立设置进程保存后只有这条路径能把「开了/关了」同步到运行期
+        # （实机踩过：只加在 _modern_settings_finished 的进程内回退分支，独立设置
+        # 进程改完配置后接收端不启动、也不生成令牌，用户以为功能坏了）。
+        self._sync_web_watch_service()
         # 外部配置变更也可能改了 agent_link.dsh（右键菜单开关落盘后同样收敛到
         # 这里）→ DSH 状态跟踪器按功能门同步启停。
         self._sync_dsh_state_tracker()
@@ -1983,6 +2046,9 @@ class AppShell:
         # "本分钟是否让位"。顺序反了会出现"报时先响、节日后响"从而两者都出声。
         self._sync_festival_service()
         self._sync_chime_service()
+        # 网页互动：默认关闭 → 不创建服务、不绑端口；开启后在此完成首次装配
+        # （此时 _shared 代理已就绪，冒泡可扇出到首个可见窗）。
+        self._sync_web_watch_service()
         # 设置页进程隔离：启动即装 config 目录 watcher，独立设置进程落盘后由它
         # 合并进运行期（开关关闭时不装，完全走旧路径）。
         self._install_config_watcher()
@@ -2370,6 +2436,10 @@ class AppShell:
         # 节日提醒同为进程级懒服务，退出必须一并停（理由同 voice_chime_service）。
         if self.festival_service is not None:
             self.festival_service.stop()
+        # 网页互动：进程级懒服务 + 本地回环监听端口，退出必须关掉 socket 并停心跳
+        # （否则端口要等进程结束才释放，重启时可能撞上"地址已在使用"）。
+        if getattr(self, "web_watch_service", None) is not None:
+            self.web_watch_service.stop()
         try:
             self._dsh_state_tracker.stop()
         except Exception:
@@ -2444,6 +2514,13 @@ class AppShell:
                     except Exception:
                         logging.debug("测试收口节日提醒服务失败", exc_info=True)
                     shell.festival_service = None
+                service = getattr(shell, "web_watch_service", None)
+                if service is not None:
+                    try:
+                        service.stop()
+                    except Exception:
+                        logging.debug("测试收口网页互动服务失败", exc_info=True)
+                    shell.web_watch_service = None
                 if getattr(shell, "instance", None) is not None:
                     win = getattr(shell.instance, "win", None)
                     lib = getattr(win, "lib", None)

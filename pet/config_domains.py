@@ -21,12 +21,14 @@ from .config import (
     _clean_quick_launch_apps,
     _merge_chat_data,
     _merge_proactive_screen_data,
+    _merge_web_watch_data,
 )
 
 __all__ = [
     "ChatConfig",
     "AgentLinkConfig",
     "ProactiveConfig",
+    "WebWatchConfig",
     "CollisionConfig",
     "MenuConfig",
 ]
@@ -84,6 +86,19 @@ class ProactiveConfig(_DomainFacade):
     @classmethod
     def normalize(cls, raw: Any) -> dict:
         return _merge_proactive_screen_data(raw)
+
+
+class WebWatchConfig(_DomainFacade):
+    """web_watch 域：Edge 网页互动（读页面内容 → 说评论/给建议）参数。
+
+    normalize 复用 config._merge_web_watch_data（默认值 + 浅合并，与 Config
+    加载路径同一函数同一产出）；数值区间的权威定义在
+    pet/web_watch/policy.py::effective_web_watch_config，本 facade 不做第二份清洗。
+    """
+
+    @classmethod
+    def normalize(cls, raw: Any) -> dict:
+        return _merge_web_watch_data(raw)
 
 
 class CollisionConfig(_DomainFacade):

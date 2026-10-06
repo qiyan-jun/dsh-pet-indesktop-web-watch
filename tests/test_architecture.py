@@ -209,7 +209,12 @@ WINDOW_PY_LINE_BUDGET = 4671
 # 实测 2391；按文件约定只随实测校准，不为达标压行（拆分仍是待办）。
 # 2026-09-27 上调到 2393：overlay 文案如实（省电模式 hint 改调 settings_pet_controls、
 # 窗口级键「对所有桌宠生效」标注接线 +2 行）。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2393
+# 2026-10-06 上调到 2403：Edge 网页互动接线（+10）——控件/行/保存全部在
+# pet/settings_web_watch.py，本文件只留四处最小接线（import、控件安装调用、
+# 域导航新增「网页互动」组、保存委托）。按文件约定只随实测校准，不为达标压行；
+# 后续该文件任何新页面仍应优先拆独立模块（先例：settings_file_interpret /
+# settings_web_watch / update_settings）。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2403
 
 
 def _read(name: str) -> str:

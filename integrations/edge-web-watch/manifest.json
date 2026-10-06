@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "大肥鱼桌宠 · 网页互动",
+  "version": "1.0.0",
+  "description": "把当前页面的标题/正文/划词/视频进度发给你自己电脑上的桌宠（只发 127.0.0.1），让它实时评论、偶尔给建议。",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "大肥鱼桌宠 · 网页互动"
+  },
+  "options_page": "options.html"
+}

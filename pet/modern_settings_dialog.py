@@ -166,6 +166,7 @@ from . import settings_file_interpret
 from . import settings_interaction
 from . import settings_music
 from . import settings_pet_controls
+from . import settings_web_watch
 from .report_gates import REPORT_GATE_KEYS, REPORT_GATE_LABELS, gate_for_event
 
 
@@ -331,6 +332,8 @@ class ModernSettingsDialog(QDialog):
         self._build_pet_controls()
         # 「文件识别」域控件在本模块构建（行数预算原因），见 settings_file_interpret。
         self._build_file_interpret_controls()
+        # 「网页互动」组控件同理（Edge 扩展 → 本地接收端），见 settings_web_watch。
+        self._build_web_watch_controls()
         # 「音乐播放器路径」控件同样在本模块构建（行数预算原因），见 settings_music。
         settings_music.create_music_player_controls(self)
         # 「随桌宠启动 dsh 服务」开关（origin/main #80 合入带回）：构建留在
@@ -1021,6 +1024,10 @@ class ModernSettingsDialog(QDialog):
     def _build_file_interpret_controls(self) -> None:
         """「文件识别」域控件（settings_file_interpret 构建，行数预算原因不在本文件展开）。"""
         settings_file_interpret.create_file_interpret_controls(self)
+
+    def _build_web_watch_controls(self) -> None:
+        """「网页互动」组控件（settings_web_watch 构建，同上）。"""
+        settings_web_watch.create_web_watch_controls(self)
 
     def _build_proactive_controls(self) -> None:
         """主动识屏页控件（仅 Windows + 有聊天能力时挂载）。"""
@@ -1854,10 +1861,12 @@ class ModernSettingsDialog(QDialog):
         loop_rows = [r for r in watchdog_rows if not r.objectName().startswith(("settingRow_stuck_", "settingRow_pattern_"))]
         dialogue_rows = claim_prefix("dialogue_")
         gate_rows = claim_prefix("report_gate_")
+        web_watch_rows = settings_web_watch.build_web_watch_rows(self)
         automation = page_content(
             [
                 ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
                 ("主动感知", proactive_rows),
+                ("网页互动", web_watch_rows),
                 ("循环检测", loop_rows),
                 ("卡住检测", stuck_rows),
                 ("行为重复检测", pattern_rows),
@@ -2301,6 +2310,7 @@ class ModernSettingsDialog(QDialog):
         if self.ai_page is not None:
             self.ai_page.save()
         settings_file_interpret.save_file_interpret_settings(self)
+        settings_web_watch.save_web_watch_settings(self)
         settings_music.save_music_player_settings(self)
         if sys.platform == "win32" and self.include_ai and hasattr(self, "pro_enabled_check"):
             from .proactive import PRESET_DEFAULTS
