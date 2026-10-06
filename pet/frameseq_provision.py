@@ -171,8 +171,9 @@ unlink 而不是一整趟编码。成本对比见 PR 报告的性能分析。
   摘出库（``setParent(None)`` + 模块级强引用）持有到跑完——QThread 带着活线程被
   销毁是 Qt 的 abort，绝不允许；
 - 无 ffmpeg exe：编码静默 no-op，但世代清扫照做（纯本地 I/O，不依赖 ffmpeg）；
-- Windows 下 ffmpeg 子进程 ``creationflags=BELOW_NORMAL_PRIORITY_CLASS``
-  （POSIX 忽略），一次性重编码的 CPU 让给交互；
+- Windows 下 ffmpeg 子进程 ``creationflags=BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW``
+  （POSIX 忽略）：一次性重编码的 CPU 让给交互；``CREATE_NO_WINDOW`` 用于避免打包后
+  （父进程无控制台）弹出黑色控制台窗口，见 ``_creation_flags`` 的说明；
 - ``PET_FRAMESEQ=0`` 整体禁用供给（dev 逃生门，不进 Config/设置页/schema）。
 
 线程模型：``FrameseqProvisionWorker`` 是 library 拥有的 QThread（QObject
@@ -1181,10 +1182,21 @@ def ffmpeg_exe() -> str | None:
 
 
 def _creation_flags() -> int:
-    """Windows：ffmpeg 低于正常优先级（POSIX 忽略，返回 0）。"""
+    """Windows：ffmpeg 低于正常优先级**且不创建控制台窗口**（POSIX 忽略，返回 0）。
+
+    ``CREATE_NO_WINDOW`` 不是可选项，是打包后的硬需求：打包出来的父进程是 GUI 子系统
+    （PE subsystem=2，**没有控制台**），此时只给优先级标志的话，Windows 会给这个
+    ffmpeg 子进程**新分配一个控制台**——用户看到的就是"双击打开桌宠后弹出一个黑色窗口"
+    （窗口标题就是 ffmpeg exe 的完整路径，实测 MainWindowHandle≠0，并伴随一个以 ffmpeg
+    为父进程的 conhost）。2026-10-06 实机复现并验证：仅加这一个标志即可消除。
+
+    两个标志可以并存（CREATE_NO_WINDOW 与优先级类互不冲突）。
+    """
     if os.name != "nt":
         return 0
-    return int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    return int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)) | int(
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
 
 
 def _ffmpeg_argv(exe: str, webm: Path, tmp_dir: Path) -> list[str]:

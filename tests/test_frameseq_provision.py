@@ -56,6 +56,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -78,6 +79,24 @@ app = QApplication.instance() or QApplication([])
 
 FRAME_COUNT = 3
 DAY_S = 24 * 3600.0
+
+
+# ------------------------------------------------- 黑窗回归（2026-10-06 实机）
+def test_creation_flags_hide_console_window():
+    """阶段一编码的 ffmpeg 必须带 CREATE_NO_WINDOW，否则打包后会弹出黑色控制台窗口。
+
+    实机复现（2026-10-06）：打包后父进程是 GUI 子系统、没有控制台，只给
+    ``BELOW_NORMAL_PRIORITY_CLASS`` 时 Windows 会给 ffmpeg 新分配控制台——
+    表现为双击桌宠后弹出一个标题为 ffmpeg exe 完整路径的黑窗，并伴随一个以
+    ffmpeg 为父进程的 conhost（用应用自身的 _creation_flags + _ffmpeg_argv
+    做 A/B：legacy 出现可见窗口，加 CREATE_NO_WINDOW 后不再出现）。
+    """
+    flags = fp._creation_flags()
+    if os.name != "nt":
+        assert flags == 0
+        return
+    assert flags & subprocess.CREATE_NO_WINDOW, "缺少 CREATE_NO_WINDOW 会在打包后弹黑窗"
+    assert flags & subprocess.BELOW_NORMAL_PRIORITY_CLASS, "优先级标志不能被挤掉"
 
 
 # ---------------------------------------------------------------- 测试夹具
