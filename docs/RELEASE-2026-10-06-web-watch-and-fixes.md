@@ -161,8 +161,8 @@ ffmpeg 12552 MainWindowHandle = 395908（非 0 = 有可见窗口）
 
 ## 五、测试与验证到什么程度
 
-- **全量测试**：`python -m pytest -q` → **4375 passed / 14 skipped，exit 0**（在包含本文档所述全部改动
-  ——含第四轮的熔断/空回复修复——的提交上跑满 10 分 48 秒，2026-10-06）；`ruff check pet tests` 全绿；
+- **全量测试**：`python -m pytest -q` → **4376 passed / 14 skipped，exit 0**（在包含本文档所述全部改动
+  ——含第四轮熔断/空回复修复与第五轮卡死修复——的提交上跑满 10 分 47 秒，2026-10-06）；`ruff check pet tests` 全绿；
 - **新增回归用例**：网页互动 60+ 条（触发策略、频控、隐私脱敏、端口自愈、设置页不回滚、唤醒与补说）、
   黑窗 1 条（`test_creation_flags_hide_console_window`，该缺陷在 CI 无法行为复现，只钉标志位）、
   交付证据纪律用例 67 条（报告三章节 + 索引登记）；
