@@ -1,0 +1,125 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:        # 手动触发（Actions 页面 → Run workflow）
+  push:
+    tags:
+      - 'v*'                # 打 tag 时自动触发并发布 Release
+
+permissions:
+  contents: write           # 用于创建 Release 上传产物
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    # 编码隔离（issue #26）：PYTHONIOENCODING 只解决控制台输出，
+    # PYTHONUTF8=1 让 locale.getpreferredencoding() 恒为 utf-8，杜绝
+    # PyInstaller/辅助脚本按 GBK/cp1252 二次解码中文源码或资源。
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      # choco 的 innosetup 包不带 ChineseSimplified.isl（官方安装包才附带），
+      # 缺少该文件 .iss 编译会失败，从 issrc 仓库取回。
+      - name: Fetch ChineseSimplified language file
+        shell: pwsh
+        run: |
+          $langDir = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\Languages'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl' -OutFile (Join-Path $langDir 'ChineseSimplified.isl')
+
+      # 与 Linux/macOS 一致：构建前先跑测试套件，避免发布损坏产物。
+      # 命令与 PR 门禁（pr-test.yml）保持同一套：时序 flake 家族从主套件里
+      # 隔离成独立步骤——它们会让整个 pytest 进程原生崩溃（exit 139/access
+      # violation），从而拖垮同一进程里其它测试的结果报告。隔离不掩盖失败：
+      # 每一族照常判红，只额外给一次重跑机会（与门禁一致）。
+      - name: Pytest (main suite)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py --deselect tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero
+
+      - name: Pytest (webm lifecycle family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py || python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py
+
+      - name: Pytest (low-priority warm family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_low_priority_warm_interaction_yield.py || python -m pytest -q tests/test_low_priority_warm_interaction_yield.py
+
+      # frameseq 原生崩溃隔离位：肇事者系 test_frameseq_clip.py 单条用例
+      # （verbose 复现钉死；watchdog 族系位置误判已排除，回归主套件）。
+      # 详见 pr-test.yml 同名单元注释，按族先例隔离 + 一次重跑。
+      - name: Pytest (frameseq native-crash isolates, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_frameseq_prefetch_watchdog.py tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero || python -m pytest -q tests/test_frameseq_prefetch_watchdog.py tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero
+
+      # 与上游发布一致：只构建 webm 两个变体（GIF 包体约 800 MB，不发布）
+      - name: Build onedir variants
+        shell: pwsh
+        run: |
+          foreach ($VARIANT in 'webm-chat', 'webm') {
+            Write-Host "==> building $VARIANT"
+            & "$env:GITHUB_WORKSPACE\scripts\build_onedir.ps1" -Variant $VARIANT
+            if ($LASTEXITCODE -ne 0) { throw "$VARIANT build failed" }
+          }
+
+      # 参数用数组 splatting 传递：行首 /D... 会被 pwsh 当作除法运算符，
+      # 含括号的显示名（如 "(WebM)"）会触发子表达式解析而报 ParserError。
+      # 版本号从 pet/__init__.py 的 __version__ 单一来源读取，避免与
+      # updater 更新检测基准漂移。
+      - name: Compile installers (Inno Setup)
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path 'pet\__init__.py' -Pattern "__version__ = '([^']+)'").Matches[0].Groups[1].Value
+          Write-Host "==> AppVersion from __version__: $version"
+          & ISCC.exe packaging\dsh-pet.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC webm-chat failed" }
+          $webm = @(
+            '/DMyAppShortName=dsh-pet-standalone-webm',
+            '/DMyAppExeName=dsh-pet-standalone-webm.exe',
+            '/DMyAppDir=..\dist-onedir\dsh-pet-standalone-webm',
+            '/DMyAppId={{3424d6cc-af3c-4383-8797-ab520b923aa6}',
+            '/DMyAppDisplay=dsh-pet-standalone (WebM)',
+            "/DMyAppVersion=$version",
+            'packaging\dsh-pet.iss'
+          )
+          & ISCC.exe @webm
+          if ($LASTEXITCODE -ne 0) { throw "ISCC webm failed" }
+          Get-ChildItem dist-onedir\*-setup.exe | ForEach-Object { Write-Host $_.Name $_.Length }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-pet-standalone-windows-x86_64
+          path: |
+            dist-onedir/*-portable.zip
+            dist-onedir/*-setup.exe
+          retention-days: 30
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-onedir/*-portable.zip
+            dist-onedir/*-setup.exe
+          generate_release_notes: true

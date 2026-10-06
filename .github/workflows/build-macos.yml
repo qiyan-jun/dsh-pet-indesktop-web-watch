@@ -1,0 +1,133 @@
+name: Build macOS App
+
+on:
+  workflow_dispatch:        # 手动触发（Actions 页面 → Run workflow）
+  push:
+    tags:
+      - 'v*'                # 打 tag 时自动触发并发布 Release
+
+permissions:
+  contents: write           # 用于创建 Release 上传产物
+
+jobs:
+  build-macos:
+    runs-on: macos-latest   # Apple Silicon（arm64）；Intel 用户请用源码运行
+    # 编码隔离（issue #26）：强制 UTF-8 模式，避免任何环节按 legacy 编码
+    # 二次解码中文源码/资源（PYTHONIOENCODING 只解决控制台输出）。
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      # GIF 变体（gif-chat / gif）不再发布：包体约 800 MB×2、上传与下载
+      # 成本过高，v4.0.0 起停供。确有需要的用户请按 README「打包发布」
+      # 一节自行构建（先运行 scripts/convert_to_gif.py 生成素材）。
+      # 命令与 PR 门禁（pr-test.yml）保持同一套：时序 flake 家族从主套件里
+      # 隔离成独立步骤——webm 生命周期族的 reader/ffmpeg teardown 竞态在 macOS
+      # CI 上偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher），
+      # 段错误会杀掉整个 pytest 进程、拖垮主套件的结果报告。隔离不掩盖失败：
+      # 每一族照常判红，只额外给一次重跑机会（与门禁一致）。
+      - name: Pytest (main suite)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py --ignore=tests/test_overlay_spawn.py --ignore=tests/test_overlay_lifecycle_gaps.py --ignore=tests/test_sprite_visibility.py --deselect tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero
+        # 三文件同进程在 macOS 确定性段错误（见 pr-test.yml 同款注释）：拆独立进程照跑
+      - name: Pytest (overlay/visibility trio, split processes)
+        run: |
+          python -m pytest -q tests/test_overlay_spawn.py
+          python -m pytest -q tests/test_overlay_lifecycle_gaps.py
+          python -m pytest -q tests/test_sprite_visibility.py
+
+      - name: Pytest (webm lifecycle family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py || python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py
+
+      - name: Pytest (low-priority warm family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_low_priority_warm_interaction_yield.py || python -m pytest -q tests/test_low_priority_warm_interaction_yield.py
+
+      # frameseq 原生崩溃隔离位：肇事者系 test_frameseq_clip.py 单条用例
+      # （verbose 复现钉死；watchdog 族系位置误判已排除，回归主套件）。
+      # 详见 pr-test.yml 同名单元注释，按族先例隔离 + 一次重跑。
+      - name: Pytest (frameseq native-crash isolates, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_frameseq_prefetch_watchdog.py tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero || python -m pytest -q tests/test_frameseq_prefetch_watchdog.py tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero
+
+      # 构建入口与本地完全一致：scripts/build_macos.sh（PyInstaller 打包 +
+      # 中文编码自检 + ad-hoc 签名都在脚本内完成），CI 不内联
+      # 任何构建命令，避免本地/CI 两套逻辑漂移。
+      # 只构建两个 webm 变体（与 Windows/Linux 发布一致）。
+      - name: Build onedir .app variants
+        run: |
+          bash scripts/build_macos.sh \
+            --dist dist \
+            --variants webm-chat,webm
+
+      - name: Verify pet module collected
+        run: |
+          for VARIANT in webm-chat webm; do
+            APP="dsh-pet-standalone-$VARIANT"
+            WARN="$(find build -name "warn-$APP.txt" | head -1)"
+            if [ -n "$WARN" ] && grep -q "missing module named pet" "$WARN"; then
+              echo "::error::$APP pet 模块未被 PyInstaller 收集"; cat "$WARN"; exit 1
+            fi
+            echo "$APP pet 模块已收集"
+            if ! find dist -path "*integrations/dsh-pet-bridge/package.json" | grep -q .; then
+              echo "::error::$APP 未打包 integrations/dsh-pet-bridge，DSH 桥接一键安装必然失败"; exit 1
+            fi
+            echo "$APP 桥接插件资源已打包"
+          done
+
+      - name: Package as zip
+        run: |
+          cd dist
+          for VARIANT in webm-chat webm; do
+            ditto -c -k --keepParent "dsh-pet-standalone-$VARIANT.app" \
+              "dsh-pet-standalone-$VARIANT-macos-arm64.zip"
+          done
+
+      - name: Verify zip preserves executable permission
+        run: |
+          for ZIP in dist/dsh-pet-standalone-*-macos-arm64.zip; do
+            rm -rf /tmp/verify && mkdir -p /tmp/verify
+            cd /tmp/verify
+            unzip -q "$GITHUB_WORKSPACE/$ZIP"
+            APP="${ZIP##*/}"; APP="${APP%-macos-arm64.zip}.app"
+            BIN="$APP/Contents/MacOS/${APP%.app}"
+            ls -l "$BIN"
+            if [ ! -x "$BIN" ]; then
+              echo "::error::$ZIP 解压后二进制丢失可执行权限"; exit 1
+            fi
+            echo "$ZIP 可执行权限保留"
+            cd "$GITHUB_WORKSPACE"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-pet-standalone-macos-arm64
+          path: dist/*.zip
+          retention-days: 30
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
