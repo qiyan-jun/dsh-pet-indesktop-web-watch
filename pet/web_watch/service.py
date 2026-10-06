@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 from ..proactive_limiter import ProactiveLimiter
 from .digest import domain_of
-from .llm import WebWatchLlmError, post_text_request
+from .llm import EmptyReplyError, WebWatchLlmError, post_text_request
 from .policy import ACTION_COMMENT, ACTION_SUGGEST, Decision, Gates, WebWatchPolicy, effective_web_watch_config
 from .prompts import build_messages, clean_reply
 from .server import DEFAULT_HOST, WebWatchServer
@@ -52,6 +52,9 @@ REFUSAL_BACKOFF_SECONDS = 10.0
 #: 频控两道下限（web_watch 专用，见 policy.effective_web_watch_config 的区间说明）
 LIMITER_MIN_INTERVAL_FLOOR = 10.0
 LIMITER_COOLDOWN_FLOOR = 0.1
+#: 连续失败熔断时长（分钟）。默认的"当日熔断"对本功能代价过大：实测 3 次空回复
+#: 就把整个下午废掉（见 PR 报告第十一节）。10 分钟后自动恢复。
+LIMITER_BREAKER_MINUTES = 10.0
 #: 状态快照写盘节流（秒）：事件可能密集，但没必要每次都落盘
 STATUS_WRITE_MIN_INTERVAL_S = 1.0
 
@@ -131,6 +134,8 @@ class WebWatchService:
             # 否则共享 clamp 的 30s 硬地板会把用户配置的 12s 顶掉（实测）。
             min_interval_floor=LIMITER_MIN_INTERVAL_FLOOR,
             cooldown_floor=LIMITER_COOLDOWN_FLOOR,
+            # 熔断按分钟计（不是"到明天"）：空回复/网络抖动不该让功能整天哑掉
+            breaker_cooldown_minutes=LIMITER_BREAKER_MINUTES,
         )
         self._bridge = _Bridge(self)
         self._bridge.bubble_requested.connect(self._bridge._forward_bubble)
@@ -166,6 +171,7 @@ class WebWatchService:
             "last_dispatch_ts": 0.0,
         }
         self._logged_skip = ""
+        self._logged_paused = ""
         self._status_written_at = 0.0
         # 被频控暂时拦下的决定（保留"已决定"状态，冷却过后若还在同一页就补说）：
         # 修复前是"release + 每秒重算"，日志里每秒一条"判定命中"，用户实际要等到
@@ -565,13 +571,38 @@ class WebWatchService:
             )
             return
         if now < self._retry_after and not retry:
-            self._note_dispatch("backoff", f"频控退避中（还剩 {self._retry_after - now:.0f}s）")
+            # 熔断/到量的提示更"有信息量"：别用通用"退避中"把它顶掉，
+            # 否则设置页状态栏就看不到真正原因了。
+            if not str(self._stats.get("last_dispatch") or "").startswith(("paused", "breaker")):
+                self._note_dispatch("backoff", f"频控退避中（还剩 {self._retry_after - now:.0f}s）")
             return
         is_new_page = bool(page_key) and page_key != self._last_spoken_page_key
         allowed, reason = self.limiter.try_acquire(
             ignore_cooldown=is_new_page and decision.action == ACTION_COMMENT
         )
         if not allowed:
+            if reason in ("paused_by_circuit_breaker", "daily_cap_reached"):
+                # 这两种不是"等一会儿就好"：留着待说内容只会每 10 秒重问一次，
+                # 把日志刷满（实测一整天每 10 秒一条）却永远说不出来。直接丢弃 +
+                # 长退避，并只打一条能看懂原因的提示。
+                self._policy.release(decision)
+                self._pending_decision = None
+                remaining = self.limiter.breaker_remaining()
+                if reason == "daily_cap_reached":
+                    wait = 900.0
+                    detail = "今日条数已达上限，明天再说"
+                elif remaining == float("inf"):
+                    wait = 1800.0
+                    detail = "当日熔断中（今天不再说话；可在设置页「网页互动 → 状态」里查看）"
+                else:
+                    wait = max(60.0, remaining)
+                    detail = f"熔断中，约 {remaining / 60.0:.0f} 分钟后自动恢复"
+                self._retry_after = now + wait
+                if self._logged_paused != reason:
+                    self._logged_paused = reason
+                    self._note_dispatch("paused", detail)
+                    log.warning("web_watch: %s（%s）", detail, reason)
+                return
             self._pending_decision = decision
             self._pending_key = page_key
             self._retry_after = now + REFUSAL_BACKOFF_SECONDS
@@ -671,16 +702,37 @@ class WebWatchService:
                 text,
             )
             self._sync_to_chat(decision, text)
+        except EmptyReplyError as exc:
+            # 空回复**不算故障**：模型有响应、只是没正文（多见于思考吃掉 tokens）。
+            # 实测把它计入连续失败会让 3 次空回复就熔断掉一整天（见 PR 报告第十一节）。
+            log.warning("web_watch: 本条无正文（不计入熔断）%s", exc)
+            self._note_dispatch("empty_reply", f"模型无正文（{exc}）")
+            self._stats["failed"] += 1
+            self._policy.release(decision)
         except WebWatchLlmError as exc:
             log.warning("web_watch: 生成失败 %s", exc)
-            self.limiter.record_failure()
+            if self.limiter.record_failure():
+                self._note_breaker_tripped()
             self._stats["failed"] += 1
+            self._policy.release(decision)
         except Exception:
             log.warning("web_watch: 生成异常", exc_info=True)
-            self.limiter.record_failure()
+            if self.limiter.record_failure():
+                self._note_breaker_tripped()
             self._stats["failed"] += 1
+            self._policy.release(decision)
         finally:
             self._request_in_flight = False
+
+    def _note_breaker_tripped(self) -> None:
+        """熔断刚被触发：留一条**醒目**日志（原来完全静默，用户只看到"它不说话了"）。"""
+        remaining = self.limiter.breaker_remaining()
+        if remaining == float("inf"):
+            detail = "今天不再说话（当日熔断）"
+        else:
+            detail = f"{remaining / 60.0:.0f} 分钟后自动恢复"
+        self._note_dispatch("breaker", f"连续失败 3 次已熔断：{detail}")
+        log.warning("web_watch: 连续失败 3 次，已熔断——%s", detail)
 
     def _show_bubble(self, text: str, duration_ms: int, *, speak: bool = True, hold: bool = True) -> None:
         """GUI 线程：冒泡（+可选语音）。扇出面由注入的 target 决定（多窗代理）。

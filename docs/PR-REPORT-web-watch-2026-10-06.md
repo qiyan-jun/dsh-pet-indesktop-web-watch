@@ -305,3 +305,62 @@ Service Worker（生产路径）与候选端口——否则端口不一致会被
 （「AI 与对话」里换更快的档位），或改成**流式**（首字到达即冒泡，估算把感知延迟压到
 1~2s 且不受总时长影响）——**未实现**，属下一步候选。
 
+## 十一、第四轮：整个下午"不说话"——空回复触发当日熔断（2026-10-06 夜）
+
+用户反馈「又不能根据网页内容输出了」。现场：链路完全正常（当日已收到 **125 条事件**、判定持续命中），
+但**每一次派发都被频控拦下**，原因不是冷却：
+
+```
+③ 最近派发 = rate_limited: 频控拦下（paused_by_circuit_breaker），已记住这条，冷却后补说
+web_watch_state.json = {"date":"2026-10-06","count":89,"consecutive_failures":3,
+                        "paused_until_date":"2026-10-06"}   ← 当日熔断
+```
+
+### 11.1 根因链（三层，逐层都有证据）
+
+1. **思考没被关掉**：`llm.py` 里关思考的判据是
+   `model_name.startswith("deepseek") and "deepseek" in base_url`；
+   用户的实际 provider 是 `DeepSeek-v4-flash-Free` @ **`https://openveer.com/v1`**（中转站），
+   域名不含 "deepseek" → **条件不成立 → 思考照开**；
+2. **预算被思考吃光**：第三轮我把 `DEFAULT_MAX_TOKENS` 从 512 收到 **192**，
+   推理模型把预算花在 reasoning 上 → `content` 为空 → 日志
+   `生成失败 模型没说话（空回复）`（当天 15:00 / 15:19 / 15:21 / 15:22 / 15:23 / 15:44 / 15:50 / 19:24 共 8 次）；
+3. **空回复被当成故障 → 当日熔断**：`service._worker_generate` 里 `except WebWatchLlmError`
+   一律 `record_failure()`，连续 3 次即写 `paused_until_date=today` →
+   **之后一整天不再说话**，而且熔断触发时**没有任何日志**（用户只能看到"它不说话了"）。
+
+补一层观测缺陷：熔断期间服务仍在**每 10 秒**重试一次并打一条同样的日志（`pet-12648.log` 里
+19:51–19:55 连续数十条），把日志刷满却没说出一个字。
+
+### 11.2 本轮修复
+
+| # | 修复 | 位置 |
+| --- | --- | --- |
+| 1 | 关思考的判据改用**模型名/供应商名**（不再要求域名含 "deepseek"），并对"中转不认该字段"的 HTTP 400/404/422 做**摘字段重试** | `llm.py` `post_text_request` |
+| 2 | `DEFAULT_MAX_TOKENS` 192 → **512**；遇 `finish_reason=length` 且正文为空时**自动把预算 ×4 重试一次**（上限 1024） | `llm.py` |
+| 3 | 空回复独立成 `EmptyReplyError`：**不计入连续失败、不触发熔断**（只记一条 WARNING + 状态栏 `empty_reply`） | `llm.py` / `service.py` |
+| 4 | 频控器支持**按分钟计的熔断**（`breaker_cooldown_minutes`，web_watch 取 **10 分钟**）；主动识屏不传该参数，保持"当日熔断"语义不变 | `proactive_limiter.py` |
+| 5 | 熔断/到量时**不再留待说内容、不再每 10 秒重问**；只打一条能看懂原因的 WARNING，并把 `paused`/`breaker` 结论写进状态快照（不被通用"退避中"顶掉） | `service.py` |
+
+### 11.3 实机处置与验证
+
+- **立即恢复**：清掉 `web_watch_state.json` 里的 `paused_until_date` 并把 `consecutive_failures` 置 0
+  （保留当日已用 `count=89`），**12 秒后**即恢复说话：
+  `21:48:07 回复（comment/selection，站点 127.0.0.1）: 125条事件全被频控拦下太可惜了…`；
+- **新增回归 5 条**：`test_llm_disables_thinking_for_relay_hosted_deepseek`、
+  `test_llm_drops_thinking_when_provider_rejects_it`、`test_llm_escalates_tokens_when_truncated_without_content`、
+  `test_llm_empty_reply_without_truncation_is_soft_error`、
+  `test_empty_reply_does_not_trip_breaker`、`test_breaker_pause_is_minutes_not_a_day`、
+  `test_breaker_refusal_does_not_spin`（另按新语义修正 1 条老用例：整天性原因走"停"分支，
+  瞬时原因才走"稍后补说"）；
+- 聚焦族 `tests/test_web_watch*.py` + `tests/test_proactive.py`：**139 passed**，`ruff` 全绿。
+
+### 11.4 教训
+
+- **熔断粒度要匹配功能代价**：把"识屏失败"的当日熔断直接复用给"网页互动"，
+  3 次空回复 = 一整天哑掉；共享组件必须把这种策略做成可注入参数（本轮已做）；
+- **静默失败是最大的坑**：熔断、空回复都只写 INFO/WARNING 而没有"用户看得见"的提示，
+  排查时只能靠状态快照。任何"停止工作"的分支都必须留一条可被找到的痕迹；
+- **调参要留安全边距**：把 `max_tokens` 从 512 压到 192 换来的延迟收益很小，
+  却让推理模型开始产出空正文——实测数据（8 次空回复）比直觉可靠。
+

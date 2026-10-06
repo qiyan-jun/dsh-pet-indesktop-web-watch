@@ -18,19 +18,31 @@ from typing import Any, Callable
 
 log = logging.getLogger("dsh-pet-standalone")
 
-#: 短评不需要长输出；太大反而拖慢生成（实测模型往返中位 4s、最差 19s）。
-#: 40 字评论 + 少量余量即可，取 192 留出推理模型偶尔的思考 token。
-DEFAULT_MAX_TOKENS = 192
+#: 短评不需要长输出；但**不能太小**：推理型模型会把预算先花在 reasoning 上，
+#: 留给正文的就不够了。实测把这里从 512 收到 192 之后，开始出现
+#: 「模型没说话（空回复）」——正文被思考吃光。取 512，并在真遇到
+#: finish_reason=length 时自动翻倍重试一次（见 post_text_request）。
+DEFAULT_MAX_TOKENS = 512
 #: 单次请求超时下限。实测免费档偶发卡住（>36s 无响应）：原来 60s × 3 次重试
 #: = 最长静默 3 分钟，用户体感就是"它死了"。收到 30s 并只重试 1 次（共 2 次尝试），
 #: 卡住的请求快速失败，不阻塞后续页面的互动。
 MIN_TIMEOUT_SECONDS = 30.0
 #: 最多尝试次数（含首次）
 MAX_ATTEMPTS = 2
+#: 空回复自动加预算的上限（见 post_text_request 的 finish_reason=length 分支）
+MAX_ESCALATED_TOKENS = 1024
 
 
 class WebWatchLlmError(RuntimeError):
     """网页评论请求失败（网络/额度/空回复）。"""
+
+
+class EmptyReplyError(WebWatchLlmError):
+    """模型有响应但正文为空。
+
+    与"网络/额度故障"分开：它**不该**计入连续失败、也不该触发熔断
+    （实测三两次空回复 → 当日熔断 → 整个下午一句不说）。
+    """
 
 
 def _detail(raw: bytes) -> str:
@@ -43,10 +55,18 @@ def _detail(raw: bytes) -> str:
     return "Provider 请求失败"
 
 
+def _finish_reason(data: Any) -> str:
+    """取 finish_reason（"length" 表示被 max_tokens 截断）。"""
+    try:
+        return str(data["choices"][0].get("finish_reason") or "")
+    except Exception:
+        return ""
+
+
 def _extract_text(data: Any) -> str:
     choices = data.get("choices") if isinstance(data, dict) else None
     if not choices:
-        raise WebWatchLlmError("模型没说话（无 choices）")
+        raise EmptyReplyError("模型没说话（无 choices）")
     message = choices[0].get("message") or {}
     content = message.get("content")
     if isinstance(content, list):  # 部分实现把 content 拆成 parts
@@ -55,7 +75,9 @@ def _extract_text(data: Any) -> str:
         )
     text = content.strip() if isinstance(content, str) else ""
     if not text:
-        raise WebWatchLlmError("模型没说话（空回复）")
+        if _finish_reason(data) == "length":
+            raise EmptyReplyError("模型把 tokens 花在思考上、没留下正文（finish_reason=length）")
+        raise EmptyReplyError("模型没说话（空回复）")
     return text
 
 
@@ -84,20 +106,26 @@ def post_text_request(
         "max_tokens": max(64, min(int(max_tokens), 1024)),
     }
     model_name = str(payload["model"] or "")
-    base_url = str(provider.base_url or "")
-    if model_name.lower().startswith("deepseek") and "deepseek" in base_url.lower():
-        # 推理模型默认开思考（十几秒才说话）：短评关掉推理直答
+    provider_name = str(getattr(provider, "name", "") or "")
+    # 关思考的判据用**模型/供应商名字**，不再要求 base_url 里含 "deepseek"：
+    # 实测 relay（openveer.com/v1）挂 deepseek 系模型时旧条件不成立，
+    # 思考照开 → max_tokens 被 reasoning 吃光 → 正文为空。
+    thinking_sent = False
+    if "deepseek" in model_name.lower() or "deepseek" in provider_name.lower():
         payload["thinking"] = {"type": "disabled"}
+        thinking_sent = True
     headers = build_browser_headers({"Content-Type": "application/json"})
     if getattr(provider, "api_key", ""):
         headers["Authorization"] = f"Bearer {provider.api_key}"
 
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
+    def _build_request():
+        return urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
     effective_timeout = max(float(timeout or getattr(provider, "timeout", 0) or 0), MIN_TIMEOUT_SECONDS)
     data: Any = None
     last_error: Exception | None = None
@@ -106,17 +134,22 @@ def post_text_request(
             raise WebWatchLlmError("今天的网页互动额度用完了")
         try:
             with urllib.request.urlopen(
-                request,
+                _build_request(),
                 timeout=effective_timeout,
                 context=_make_ssl_context(getattr(provider, "verify_ssl", True)),
             ) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
-            break
         except urllib.error.HTTPError as exc:
             try:
                 raw = exc.read(2048)
             except Exception:
                 raw = b""
+            if thinking_sent and exc.code in (400, 404, 422):
+                # 该中转不认 thinking 字段：摘掉再试一次（比整条评论失败划算）
+                payload.pop("thinking", None)
+                thinking_sent = False
+                log.warning("web_watch: provider 不认 thinking 字段（HTTP %s），已摘掉重试", exc.code)
+                continue
             if exc.code == 429 and attempt < 1:
                 last_error = exc
                 time.sleep(2.0)
@@ -124,8 +157,22 @@ def post_text_request(
             raise WebWatchLlmError(_detail(raw)) from exc
         except (urllib.error.URLError, OSError) as exc:
             last_error = exc
-        if attempt < MAX_ATTEMPTS - 1:
-            time.sleep(1.0)
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(1.0)
+            continue
+        # 拿到了响应：先试取正文；被 max_tokens 截断（思考吃光）时加预算重试一次
+        try:
+            return _extract_text(data)
+        except EmptyReplyError:
+            current = int(payload["max_tokens"])
+            if _finish_reason(data) == "length" and current < MAX_ESCALATED_TOKENS:
+                payload["max_tokens"] = min(current * 4, MAX_ESCALATED_TOKENS)
+                log.warning(
+                    "web_watch: 模型被 max_tokens 截断（无正文），把预算 %d 提到 %d 再试",
+                    current, payload["max_tokens"],
+                )
+                continue
+            raise
     if data is None:
         if isinstance(last_error, urllib.error.HTTPError):
             raise WebWatchLlmError("模型当前访问量大（免费档高峰限流），等会儿再说") from last_error

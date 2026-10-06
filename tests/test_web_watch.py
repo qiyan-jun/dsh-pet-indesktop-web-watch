@@ -366,3 +366,108 @@ def test_make_digest_from_remembered_page_matches_event_digest():
     assert decision is not None
     assert decision.digest["title"] == "标题"
     assert decision.digest["hash"] == build_digest(event)["hash"]
+
+# ---------------------------------------------------------------- llm 请求构造
+class _FakeProvider:
+    """够 llm.post_text_request 用的最小 provider 替身。"""
+
+    def __init__(self, *, model="DeepSeek-v4-flash-Free", base_url="https://openveer.com/v1", name=""):
+        self.model = model
+        self.base_url = base_url
+        self.chat_path = "/v1/chat/completions"
+        self.temperature = 0.7
+        self.api_key = "k"
+        self.timeout = 0
+        self.verify_ssl = True
+        self.name = name
+
+
+def _stub_urlopen(monkeypatch, replies):
+    """把 urlopen 换成按顺序返回 replies 的打桩，并记录每次请求体。"""
+    import io
+    import json as _json
+    import urllib.request as _u
+
+    sent: list[dict] = []
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake(req, *args, **kwargs):
+        sent.append(_json.loads(req.data.decode("utf-8")))
+        payload = replies[min(len(sent) - 1, len(replies) - 1)]
+        return _Resp(_json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(_u, "urlopen", fake)
+    return sent
+
+
+def test_llm_disables_thinking_for_relay_hosted_deepseek(monkeypatch):
+    """中转站（域名不含 deepseek）挂 deepseek 系模型时，也必须关思考。
+
+    实测缺陷：旧条件要求 base_url 里含 "deepseek"，于是 openveer.com/v1 上的
+    DeepSeek-v4-flash-Free 照常思考，把 max_tokens 花光 → 正文为空 →
+    「模型没说话（空回复）」→ 三次即熔断掉一整天。
+    """
+    from pet.web_watch import llm
+
+    sent = _stub_urlopen(monkeypatch, [{"choices": [{"message": {"content": "一句评论"}}]}])
+    text = llm.post_text_request([{"role": "user", "content": "hi"}], _FakeProvider())
+    assert text == "一句评论"
+    assert sent[0]["thinking"] == {"type": "disabled"}
+
+
+def test_llm_drops_thinking_when_provider_rejects_it(monkeypatch):
+    """中转站不认 thinking 字段时，摘掉它重试，而不是整条评论失败。"""
+    import urllib.error
+    import urllib.request as _u
+
+    from pet.web_watch import llm
+
+    sent = _stub_urlopen(monkeypatch, [{"choices": [{"message": {"content": "重试后的评论"}}]}])
+    state = {"first": True}
+    real_fake = _u.urlopen
+
+    def fake(req, *args, **kwargs):
+        if state["first"]:
+            state["first"] = False
+            import json as _json
+            sent.append(_json.loads(req.data.decode("utf-8")))
+            raise urllib.error.HTTPError(req.full_url, 400, "bad request", {}, None)
+        return real_fake(req, *args, **kwargs)
+
+    monkeypatch.setattr(_u, "urlopen", fake)
+    text = llm.post_text_request([{"role": "user", "content": "hi"}], _FakeProvider())
+    assert text == "重试后的评论"
+    assert "thinking" in sent[0]
+    assert "thinking" not in sent[1], "被拒后应摘掉该字段"
+
+
+def test_llm_escalates_tokens_when_truncated_without_content(monkeypatch):
+    """被 max_tokens 截断且没有正文时，自动提高预算重试一次。"""
+    from pet.web_watch import llm
+
+    sent = _stub_urlopen(
+        monkeypatch,
+        [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "加预算后的评论"}, "finish_reason": "stop"}]},
+        ],
+    )
+    text = llm.post_text_request([{"role": "user", "content": "hi"}], _FakeProvider(), max_tokens=192)
+    assert text == "加预算后的评论"
+    assert sent[0]["max_tokens"] == 192
+    assert sent[1]["max_tokens"] > sent[0]["max_tokens"], "必须提高预算再试"
+
+
+def test_llm_empty_reply_without_truncation_is_soft_error(monkeypatch):
+    """没被截断却是空正文 → EmptyReplyError（调用方按"不计熔断"处理）。"""
+    from pet.web_watch import llm
+
+    _stub_urlopen(monkeypatch, [{"choices": [{"message": {"content": "  "}, "finish_reason": "stop"}]}])
+    with pytest.raises(llm.EmptyReplyError):
+        llm.post_text_request([{"role": "user", "content": "hi"}], _FakeProvider())

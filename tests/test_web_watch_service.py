@@ -349,6 +349,9 @@ def test_rate_limit_refusal_backs_off_instead_of_polling_every_tick(tmp_path, mo
     实测缺陷背景：``ProactiveLimiter.try_acquire()`` 在拒绝时**不盖时间戳**，若服务
     每个 1s tick 都重问一遍，就是 1Hz 的跨进程文件锁 + 读盘（纯浪费）。本用例把
     try_acquire 换成计数器，断言 3 秒内只被问一次。
+
+    这里用**瞬时**原因（冷却中）：它走"记住这条、稍后补说"的路径。整天性的原因
+    （熔断 / 到量）走另一条路——见 ``test_breaker_refusal_does_not_spin``。
     """
     monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "不该出现")
     calls: list[int] = []
@@ -357,13 +360,14 @@ def test_rate_limit_refusal_backs_off_instead_of_polling_every_tick(tmp_path, mo
         monkeypatch.setattr(
             service.limiter,
             "try_acquire",
-            lambda **kwargs: (calls.append(1), (False, "daily_cap_reached"))[1],
+            lambda **kwargs: (calls.append(1), (False, "cooldown_active"))[1],
         )
         assert _post_to(service, _page())[0] == 204
         _pump(3.0)
         assert len(calls) == 1, f"退避期内不得反复询问频控（实际 {len(calls)} 次）"
         assert fake.bubbles == []
         assert service.status()["last_reason"].startswith("rate_limited")
+        assert service._pending_decision is not None, "瞬时原因应保留这条、稍后补说"
     finally:
         service.stop()
 
@@ -708,6 +712,101 @@ def test_limiter_floors_are_lowered_for_web_watch(tmp_path):
     legacy = ProactiveLimiter(config.dir / "legacy_state.json", {"min_request_interval_seconds": 12, "cooldown_minutes": 0.1})
     assert legacy.cfg["min_request_interval_seconds"] == 30
     assert abs(legacy.cfg["cooldown_minutes"] - 0.5) < 1e-9
+
+
+def test_empty_reply_does_not_trip_breaker(tmp_path, monkeypatch):
+    """空回复（模型有响应但正文为空）不得计入连续失败、不得熔断掉一整天。
+
+    实测缺陷（2026-10-06）：思考型模型把 max_tokens 花在 reasoning 上 → 正文为空
+    → 旧代码把它当故障 → 3 次即当日熔断 → 之后整个下午一句话都不说，
+    而用户只看到"它不说话了"（熔断触发时旧代码也没有任何日志）。
+    """
+    from pet.web_watch.llm import EmptyReplyError
+
+    def _empty(*_a, **_k):
+        raise EmptyReplyError("模型没说话（空回复）")
+
+    monkeypatch.setattr(service_mod, "post_text_request", _empty)
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
+    # 频控放行（本用例要验的是"空回复不累计失败"，不是在测频控节流）
+    monkeypatch.setattr(service.limiter, "try_acquire", lambda **kwargs: (True, "ok"))
+    try:
+        for _ in range(4):  # 够触发 3 次熔断的次数
+            assert _post_to(service, _page())[0] == 204
+            assert _wait_until(lambda: "empty_reply" in service.status()["last_dispatch"], timeout=8.0)
+            service._policy.reset()
+        assert service.limiter.allow()[0] is True, "空回复不得把熔断打开"
+        assert service.limiter._load_state().get("consecutive_failures", 0) == 0
+        assert fake.bubbles == []
+    finally:
+        service.stop()
+
+
+def test_breaker_pause_is_minutes_not_a_day(tmp_path):
+    """web_watch 的熔断按时长计（默认 10 分钟），到点自动恢复；主动识屏仍是当日熔断。"""
+    from pet.proactive_limiter import ProactiveLimiter
+
+    now = {"t": 1_000_000.0}
+    lim = ProactiveLimiter(
+        tmp_path / "s.json", {"daily_cap": 100},
+        clock=lambda: now["t"], today=lambda: "2026-10-06",
+        breaker_cooldown_minutes=10.0,
+    )
+    assert lim.record_failure() is False
+    assert lim.record_failure() is False
+    assert lim.record_failure() is True, "第 3 次连续失败应触发熔断"
+    assert lim.allow()[1] == "paused_by_circuit_breaker"
+    assert 500 < lim.breaker_remaining() <= 600
+    now["t"] += 601  # 10 分钟后
+    assert lim.allow()[0] is True, "按分钟计的熔断到点必须自动恢复"
+    assert lim.breaker_remaining() == 0
+
+    # 主动识屏（不传时长）：仍是"当日熔断"，不会自动恢复
+    legacy = ProactiveLimiter(tmp_path / "p.json", {"daily_cap": 100}, clock=lambda: now["t"], today=lambda: "2026-10-06")
+    for _ in range(3):
+        legacy.record_failure()
+    assert legacy.allow()[1] == "paused_by_circuit_breaker"
+    assert legacy.breaker_remaining() == float("inf")
+    legacy.clear_breaker()
+    # 注意：清熔断不等于立刻放行——最小请求间隔/冷却仍在（这是防刷底线），
+    # 这里只断言"熔断这个原因已经不在了"。
+    assert legacy.allow()[1] != "paused_by_circuit_breaker"
+
+
+def test_breaker_refusal_does_not_spin(tmp_path, monkeypatch):
+    """熔断/到量时不留待说内容、不每 10 秒重问（旧行为把日志刷了一整天）。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "不该出现")
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        service.limiter, "try_acquire",
+        lambda **kwargs: (calls.append(1), (False, "paused_by_circuit_breaker"))[1],
+    )
+    monkeypatch.setattr(service.limiter, "breaker_remaining", lambda: 600.0)
+    try:
+        assert _post_to(service, _page())[0] == 204
+        assert _wait_until(lambda: len(calls) == 1, timeout=8.0)
+        _pump(2.0)
+        assert len(calls) == 1, "熔断期间不得反复重问"
+        assert service._pending_decision is None, "熔断期间不该留待说内容"
+        assert service.status()["last_dispatch"].startswith("paused")
+        assert fake.bubbles == []
+    finally:
+        service.stop()
+
+
+def test_state_file_with_bom_is_not_treated_as_corrupt(tmp_path):
+    """带 BOM 的状态文件不得被当成"损坏"而静默重建（实测：手改清熔断时计数被归零）。"""
+    from pet.proactive_limiter import ProactiveLimiter
+
+    path = tmp_path / "s.json"
+    path.write_text('\ufeff{"date": "2026-10-06", "count": 42}', encoding="utf-8")
+    lim = ProactiveLimiter(path, {"daily_cap": 100}, clock=lambda: 1_000_000.0, today=lambda: "2026-10-06")
+    assert lim._load_state()["count"] == 42, "BOM 不该让计数归零"
 
 
 # ---------------------------------------------------------------- 设置页契约

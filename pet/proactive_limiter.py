@@ -185,6 +185,7 @@ class ProactiveLimiter:
         today: Callable[[], str] | None = None,
         min_interval_floor: float = 30.0,
         cooldown_floor: float = 0.5,
+        breaker_cooldown_minutes: float | None = None,
     ) -> None:
         self.raw_state_path = Path(state_path)
         self.dry_run = dry_run
@@ -198,6 +199,12 @@ class ProactiveLimiter:
         # 明确感到迟钝（实测：配置 12s 被这里顶回 30s）。
         self._min_interval_floor = float(min_interval_floor)
         self._cooldown_floor = float(cooldown_floor)
+        # 熔断时长：默认 None = 沿用"当日熔断"（主动识屏语义，行为不变）；
+        # web_watch 传分钟数——实测「偶发 3 次空回复 → 整个下午不再说话」，
+        # 对网页互动而言代价过大（见 PR 报告第十一节）。
+        self._breaker_cooldown_minutes = (
+            None if breaker_cooldown_minutes is None else max(0.0, float(breaker_cooldown_minutes))
+        )
         self.cfg = self._effective_config(cfg)
         self._clock = clock
         self._today_fn = today or (lambda: datetime.date.today().isoformat())
@@ -297,7 +304,10 @@ class ProactiveLimiter:
 
         if self.state_path.is_file():
             try:
-                raw_state = json.loads(self.state_path.read_text(encoding="utf-8"))
+                # utf-8-sig：容忍别人（记事本/PowerShell Set-Content/跨平台工具）
+                # 写出的 BOM——否则一次手改就会让整份状态被当成"损坏"而静默重建
+                # （实测：手改清熔断时被 BOM 顶掉，当日已用计数从 89 归零）。
+                raw_state = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
             except (OSError, ValueError):
                 raw_state = None  # 文件损坏或不可读，使用默认状态
 
@@ -383,6 +393,9 @@ class ProactiveLimiter:
 
         if state.get("paused_until_date") == current_today:
             return False, "paused_by_circuit_breaker"
+        # 时间制熔断（web_watch 专用，见 __init__ 的 breaker_cooldown_minutes）
+        if float(state.get("paused_until_ts", 0.0) or 0.0) > now:
+            return False, "paused_by_circuit_breaker"
 
         daily_cap = int(self.cfg.get("daily_cap", 15))
         if int(state.get("count", 0)) >= daily_cap:
@@ -456,8 +469,12 @@ class ProactiveLimiter:
     def record_failure(self) -> bool:
         """记录一次请求失败。
 
-        若连续失败次数达到 3 次，触发当日熔断（paused_until_date=today）。
-        返回: 是否触发了当日熔断。
+        连续失败达到 3 次即触发熔断，返回 True。熔断时长取决于构造参数：
+
+        - 默认（``breaker_cooldown_minutes is None``）：**当日熔断**
+          （``paused_until_date=today``）——主动识屏的既有语义；
+        - 传了分钟数：写 ``paused_until_ts = now + N*60``，**到点自动恢复**。
+          web_watch 用它：实测三两次空回复就把整个下午废掉，代价不成比例。
         """
         with self._locked():
             state = self._load_state()
@@ -468,8 +485,29 @@ class ProactiveLimiter:
 
             tripped = False
             if fails >= 3:
-                state["paused_until_date"] = self._today_fn()
+                if self._breaker_cooldown_minutes is None:
+                    state["paused_until_date"] = self._today_fn()
+                else:
+                    state["paused_until_ts"] = now + self._breaker_cooldown_minutes * 60.0
                 tripped = True
 
             self._save_state(state)
             return tripped
+
+    def breaker_remaining(self) -> float:
+        """熔断剩余秒数（无常开熔断时返回 0）；供调用方决定退避时长与日志文案。"""
+        with self._locked():
+            state = self._load_state()
+            now = self._clock()
+            if state.get("paused_until_date") == self._today_fn():
+                return float("inf")
+            return max(0.0, float(state.get("paused_until_ts", 0.0) or 0.0) - now)
+
+    def clear_breaker(self) -> None:
+        """手动解除熔断（设置页/排查用）：清掉两种熔断标记与连续失败计数。"""
+        with self._locked():
+            state = self._load_state()
+            state.pop("paused_until_date", None)
+            state.pop("paused_until_ts", None)
+            state["consecutive_failures"] = 0
+            self._save_state(state)
