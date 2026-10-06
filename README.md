@@ -1,5 +1,20 @@
 # dsh-pet-indesktop
 
+> ## ⚠️ 本仓库是第三方修改版（衍生作品 / Derivative Work）
+>
+> 本仓库基于 **[MerZlin/dsh-pet-indesktop](https://github.com/MerZlin/dsh-pet-indesktop)** 修改而来：
+> 原作者 **Merzlin**，许可证 **MIT License（Copyright (c) 2026 Merzlin）**，本仓库的基线为其
+> **v4.2.1** 源码树。
+>
+> - **上游的一切**（全部原有功能、动画素材、角色形象、文案、文档与设计）版权与功劳归原作者 **Merzlin** 所有；
+>   本仓库保留原 `LICENSE` 与版权声明，未移除任何署名。
+> - 本仓库只在其之上**新增/修改了下面列出的内容**（见
+>   [「本仓库相对上游的改动」](#本仓库相对上游的改动) 与
+>   [`docs/RELEASE-2026-10-06-web-watch-and-fixes.md`](docs/RELEASE-2026-10-06-web-watch-and-fixes.md)）。
+> - 想要**原版桌宠**、原版发布包与完整帮助文档，请前往上游仓库：
+>   <https://github.com/MerZlin/dsh-pet-indesktop>（本仓库的 issue 只处理本仓库的改动）。
+
+
 <p align="center">
   <a href="https://github.com/MerZlin/dsh-pet-indesktop/releases"><img alt="版本" src="https://img.shields.io/github/v/release/MerZlin/dsh-pet-indesktop?label=%E7%89%88%E6%9C%AC&color=blue"></a>
   <a href="https://github.com/MerZlin/dsh-pet-indesktop/releases"><img alt="总下载" src="https://img.shields.io/github/downloads/MerZlin/dsh-pet-indesktop/total?label=%E6%80%BB%E4%B8%8B%E8%BD%BD&color=brightgreen"></a>
@@ -19,6 +34,63 @@
 > **v4.2.1（2026-09-23 发布）**：v4.2.0 之后又并入 57 个已合并 PR、192 个提交，**逐项清单见 [v4.2.0 以来的变更（v4.2.1）](#v420-以来的变更v421)、[v4.2.1 发布草稿](docs/RELEASE-v4.2.1.md)（含发布前测试清单与视频预演脚本）与下方 [最近修复与变更记录](#最近修复与变更记录)**。新功能：灵动岛重做（#113）、语音报时 `voice_chime`（#118 / #125）、节日提醒 `festival_reminder`（#127）、事件汇报概率门（#97）、气泡文字大小可调（#153）、Harness 服务重启/停止（#153）、聊天背景裁切取景（#163 / #167 / #169 / #170）、音乐歌词显示与「上一首」（#128 / #129 / #135）、**歌词对齐（#175）**、**点击台词朗读与本机语音预缓存（#176）**、**音乐播放器路径进设置页（#177）**、**「互动」域设置页分页（#179）**。关键修复：Windows 关机/注销弹 `0xc0000142`（#112，issue #111）、桥接插件归零外部依赖（#104）、DSH 事件层系统性收尾（#105）、启动即按配置装配可选服务（#100 / #102）、单进程多开下主动识屏永不触发（#145）、Linux 屏幕边缘无法贴边（#137）、岛碰撞改同步硬墙（#173）、AI 会话窗不再「贴不到底」、**edge 音色被下架后「配了却不出声」自动兜底（#178）**、**构建不再被 PyInstaller 的 Qt 绑定互斥中止 + 产物 TTS 自检（#180）**。回退：`#136` / `#131`（歌词显示审计 + 节日动画/生日）已由 `#143` 撤出。
 >
 > 发布形态为 **onedir 目录打包 + Inno Setup 安装包（`.exe`）+ 便携 zip 绿色版**：安装版与绿色版运行期都不解压、不产生临时缓存，启动快、卸载干净。v4.2.0 完整发布清单见 [`docs/RELEASE-v4.2.0.md`](docs/RELEASE-v4.2.0.md)，**v4.2.1 发布草稿（含测试清单与视频预演脚本）见 [`docs/RELEASE-v4.2.1.md`](docs/RELEASE-v4.2.1.md)**，产物见 [GitHub Releases](https://github.com/MerZlin/dsh-pet-indesktop/releases)。
+
+## 本仓库相对上游的改动
+
+> 本节的每一项都由本仓库作者（非上游）新增或修改；**上游原有功能没有被动过语义**（除了下面明确列出的两处修复）。
+> 详细实现、实测数据、验证方式与已知边界见 [`docs/RELEASE-2026-10-06-web-watch-and-fixes.md`](docs/RELEASE-2026-10-06-web-watch-and-fixes.md)。
+
+### 1. 新功能：Edge 网页内容实时互动（`web_watch`）
+
+让桌宠**读你当前正在看的网页**，实时说一句与内容相关的话，偶尔给一条建议。
+
+**效果**（实机跑出来的原话，站点与内容相关）：
+
+| 你正在看的页面 | 桌宠说的话 |
+| --- | --- |
+| 一篇讲「桌面宠物留存瓶颈」的文章 | 「原来频繁打断用户三天就能劝退，这数据太真实了」 |
+| 某技术页（`page_dwell` 触发） | 「放弃谈判直接动手，这次行动够干脆利落！」 |
+| 划词选中一段文字 | 「8% CPU 换 60fps 这性能优化可以啊」 |
+| 在长文页停留较久 | 「建议收藏这篇文章并添加标签……」 |
+
+**怎么用**：`Edge` 里加载 `integrations/edge-web-watch/`（三步，见
+[扩展说明](integrations/edge-web-watch/README.md)）→ 桌宠设置页「自动化与联动 → 网页互动」打开 →
+在网页里正常浏览即可。
+
+**隐私边界**（设计如此，非事后补救）：只连 `127.0.0.1` 本机回环；请求带 32 位令牌鉴权（`hmac.compare_digest`）；
+URL 进门前就**丢掉查询串与片段**；日志只记域名与长度，不记标题与正文；默认**全关**，且提供域名黑/白名单。
+
+### 2. 反应速度（实测提速）
+
+| 阶段 | 改动前 | 改动后 |
+| --- | --- | --- |
+| 网页事件到达 → 策略判定 | 0 ~ 5 秒 | **1 ~ 2 毫秒** |
+| 判定命中 → 发出模型请求 | 最多 30 秒 | **8 ~ 111 毫秒** |
+| **端到端（打开页面 → 冒泡）** | 典型 ~4 秒、最差 ~25 秒 | **0.998 秒**（实测样本） |
+
+手段：事件到达即唤醒（不等心跳）、换到新页面免「同页冷却」、被频控拦下改为记住内容稍后补说、
+派发瞬间先冒一句「让我看看……」、正文摘录 1200→600 字、`max_tokens` 512→192、卡住的请求 60s×3 改为 30s×2。
+
+### 3. 四处健壮性修复（都是实机暴露出来的）
+
+| 修复 | 现象 | 根因 |
+| --- | --- | --- |
+| 独立设置进程保存不再回滚未改动字段 | 「在设置里关掉语音朗读，保存后桌宠突然又连不上了」 | 设置页是独立进程，保存时把**打开那一刻**的整份旧配置写回，端口/dry-run 被静默回滚 |
+| 扩展端口自愈 | 「刚才还好好的，怎么又连不上」 | 两侧端口不一致时 `fetch` 只报 `TypeError`，人眼无从判断；现在扩展会自己扫描候选端口并提示该改成哪个 |
+| 热加载路径同步 | 「设置里开了，接收端却不启动」 | `_apply_external_config_change()` 没接线到 `web_watch` |
+| 事件先记录再判守卫 | 「开了却一句话都不说」 | 守卫（Agent 忙/不可见）先于页面身份记录执行，事件被整条丢弃 |
+
+### 4. 修复：打包后双击弹黑色控制台窗口
+
+**现象**：双击安装目录的 `.exe` 后弹出一个黑色窗口，标题是 ffmpeg 的完整路径。
+
+**根因**（进程链实测：`conhost ← ffmpeg ← 桌宠`，ffmpeg `MainWindowHandle≠0`）：帧序列阶段一编码派生
+ffmpeg 时 `creationflags` 只有 `BELOW_NORMAL_PRIORITY_CLASS`，而打包后的父进程是 GUI 子系统
+（PE subsystem=2，**没有控制台**），Windows 于是给子进程新分配一个**可见**控制台。
+
+**修法**：补上 `CREATE_NO_WINDOW`（`pet/frameseq_provision.py::_creation_flags`）。验证：用产品自身
+`_creation_flags`/`_ffmpeg_argv` 做 A/B（旧标志有窗 / 新标志无窗），并在部署后删掉 3872 个已转换帧强制
+重编码、盯窗 90 秒——ffmpeg 有窗口句柄采样 **0** 次，同时重建 422 帧（证明测试非空转）。
 
 ## 开发约束与规则
 
