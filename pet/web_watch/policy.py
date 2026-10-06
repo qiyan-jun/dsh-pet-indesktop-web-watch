@@ -58,6 +58,9 @@ DEFAULT_WEB_WATCH_CONFIG: dict[str, Any] = {
     "suggest_idle_seconds": 45.0,
     "suggest_min_text_chars": 200,
     "speak_enabled": False,
+    # 流水线可见性：把"收到事件/跳过原因/派发结论"写进日志与状态快照。
+    # 默认开——这是用户排查"为什么没反应"的唯一入口，噪音很低（跳过原因只在变化时打）。
+    "verbose_log": True,
     "cooldown_minutes": 2.0,
     "daily_cap": 60,
     "min_request_interval_seconds": 30,
@@ -95,6 +98,7 @@ _BOOL_KEYS = (
     "video_enabled",
     "suggest_enabled",
     "speak_enabled",
+    "verbose_log",
 )
 _LIST_KEYS = ("whitelist", "blacklist")
 
@@ -324,6 +328,11 @@ class WebWatchPolicy:
             return Decision(ACTION_COMMENT, "selection", self._make_digest(self._selection_event(selection)))
 
         dwell = now - self._first_seen
+        # 先把"为什么还没说话"说清楚：笼统的 none 对用户排查毫无帮助
+        if not self._commented and dwell < cfg["dwell_seconds"]:
+            return self._skip("waiting_dwell")
+        if not self._commented and self._text_len < cfg["min_text_chars"]:
+            return self._skip("text_too_short")
         if (
             cfg["comment_enabled"]
             and not self._commented

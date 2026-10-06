@@ -60,6 +60,13 @@
     return !settings.enabled || isPaused() || hasPasswordField();
   }
 
+  function blockedReason() {
+    if (!settings.enabled) return "扩展总开关关着（扩展选项里打开）";
+    if (isPaused()) return "本网站被暂停（弹窗里取消勾选）";
+    if (hasPasswordField()) return "页面含密码框，按隐私规则整体不发送";
+    return "";
+  }
+
   function pickMainNode() {
     for (const selector of MAIN_SELECTORS) {
       const node = document.querySelector(selector);
@@ -98,10 +105,19 @@
   }
 
   function send(kind, extra) {
-    if (blocked()) return;
+    if (blocked()) {
+      console.info("[桌宠网页互动] 不发这条（" + kind + "）：" + blockedReason());
+      return;
+    }
     const payload = Object.assign(
       { kind: kind, url: location.href, title: document.title || "", ts: Date.now() / 1000 },
       extra || {}
+    );
+    // 页面控制台可见：这是"到底读到内容没有、什么时候读的"的第一手证据
+    console.info(
+      "[桌宠网页互动] 读取并发送 " + kind + " @ " + location.hostname +
+      " · 正文 " + String((payload.text || "").length) + " 字" +
+      " · 划词 " + String((payload.selection || "").length) + " 字"
     );
     try {
       chrome.runtime.sendMessage({ type: "webwatch:event", payload: payload });
@@ -178,7 +194,20 @@
     for (const key of Object.keys(changes)) settings[key] = changes[key].newValue;
   });
 
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message && message.type === "webwatch:snapshot") sendPage("page_open");
+  // 弹窗会用它做两件事：① 探测"本页到底有没有注入脚本"（必须有回应，
+  // 否则 chrome.tabs.sendMessage 的 lastError 会把"在跑"也误判成"没注入"）；
+  // ② 用户点「让桌宠现在就看看这页」时立刻补发一条。
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (!message || message.type !== "webwatch:snapshot") return false;
+    sendPage("page_open");
+    if (typeof sendResponse === "function") {
+      sendResponse({
+        ok: true,
+        host: location.hostname,
+        textLen: mainText().length,
+        blocked: blockedReason(),
+      });
+    }
+    return true;
   });
 })();

@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "把当前页面的标题/正文/划词/视频进度发给你自己电脑上的桌宠（只发 127.0.0.1），让它实时评论、偶尔给建议。",
   "permissions": ["storage", "tabs"],
-  "host_permissions": ["http://127.0.0.1/*"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
   "background": {
     "service_worker": "background.js"
   },

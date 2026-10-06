@@ -455,6 +455,8 @@ def _default_web_watch_data() -> dict:
         "suggest_idle_seconds": 45.0,
         "suggest_min_text_chars": 200,
         "speak_enabled": False,
+        # 详细日志：收到事件/跳过原因/派发结论写进 pet 日志（排查"没反应"的入口）
+        "verbose_log": True,
         "cooldown_minutes": 2.0,
         "daily_cap": 60,
         "min_request_interval_seconds": 30,
@@ -1530,6 +1532,7 @@ class Config:
                 "video_enabled",
                 "suggest_enabled",
                 "speak_enabled",
+                "verbose_log",
             ):
                 ww[_flag] = _bool_or_default(ww.get(_flag), bool(_ww_defaults[_flag]))
             for _num, (_low, _high) in {

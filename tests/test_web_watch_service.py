@@ -19,6 +19,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -445,6 +446,123 @@ def test_external_config_change_syncs_web_watch_service(tmp_path, monkeypatch):
         assert service.is_running() is False
     finally:
         shell._on_about_to_quit()
+
+
+def test_status_snapshot_file_records_pipeline_stages(tmp_path, monkeypatch):
+    """状态快照必须回答用户三问：读到了吗 / 何时读的 / 处理到哪一步。
+
+    实测背景：没有这份快照时，用户只能看到"什么都没发生"——接收端在跑、事件也收下了，
+    却无法区分"扩展没发出来""被策略跳过""频控拦下""模型弃权"这四种完全不同的情况。
+    """
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "一条评论")
+    service, _fake, config = _service(tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10)
+    try:
+        assert _post_to(service, _page())[0] == 204
+        status_path = config.dir / service_mod.STATUS_FILE_NAME
+        assert _wait_until(lambda: status_path.is_file(), timeout=8.0)
+        assert _wait_until(lambda: json.loads(status_path.read_text(encoding="utf-8")).get("received", 0) >= 1)
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        assert data["last_event_kind"] == "page_open"
+        assert data["last_event_domain"] == "github.com"
+        assert data["last_event_text_len"] > 0
+        assert data["last_decision"].startswith("comment/")
+        assert data["last_dispatch"], "派发阶段也必须留痕（否则无法区分'没说话'与'说了但失败'）"
+        assert data["port"] == service.status()["port"]
+    finally:
+        service.stop()
+
+
+def test_status_snapshot_records_skip_reason_when_not_speaking(tmp_path):
+    """没说话时必须留下原因（否则用户只能猜）。"""
+    service, _fake, config = _service(tmp_path, enabled=True, port=0, dwell_seconds=600)
+    try:
+        assert _post_to(service, _page())[0] == 204
+        status_path = config.dir / service_mod.STATUS_FILE_NAME
+        assert _wait_until(
+            lambda: status_path.is_file()
+            and "waiting_dwell" in json.loads(status_path.read_text(encoding="utf-8")).get("last_skip", "")
+        ), "状态快照里应记录跳过原因（含机器可读的原因码）"
+    finally:
+        service.stop()
+
+
+def test_pipeline_stages_are_logged(tmp_path, monkeypatch, caplog):
+    """三段日志（收到事件 / 暂不说话 / 派发）是用户排查的唯一入口，用 caplog 钉住。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "一条评论")
+    service, _fake, _cfg = _service(tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10)
+    try:
+        with caplog.at_level("INFO", logger="dsh-pet-standalone"):
+            assert _post_to(service, _page())[0] == 204
+            assert _wait_until(
+                lambda: any("收到事件" in record.getMessage() for record in caplog.records)
+            ), "必须留下'收到了什么'的日志"
+            assert _wait_until(
+                lambda: any("派发模型请求" in record.getMessage() for record in caplog.records)
+            ), "必须留下'已发出请求'的日志"
+        text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "收到事件 #1" in text
+        assert "站点=github.com" in text
+        assert "正文=" in text
+    finally:
+        service.stop()
+
+
+def test_settings_save_does_not_clobber_untouched_fields(tmp_path):
+    """设置页保存不得回滚"用户没碰过"的字段（实测缺陷）。
+
+    复现：设置页是独立进程，Config 是打开那一刻的快照。用户只是去关了「语音朗读」
+    然后保存，结果把运行期已经生效的端口改动（8765 → 8755）连同 dry-run 一起写回旧值，
+    桌宠随即改绑旧端口 → 扩展"突然又连不上"。
+    """
+    from pet import settings_web_watch as page
+
+    config = Config(base=tmp_path)
+    cfg = dict(config.get("web_watch") or {})
+    cfg.update({"enabled": True, "port": 8765, "dry_run": False, "speak_enabled": True})
+    config.set("web_watch", cfg)
+    assert config.save()
+    dialog = _FakeDialog(config)
+    try:
+        page.create_web_watch_controls(dialog)  # 打开：快照 = {port: 8765, dry_run: False, speak: True}
+
+        # 模拟"运行期被改过"：磁盘上已经是 8755 + dry_run True（热加载生效中的值）
+        disk = json.loads(Path(config.path).read_text(encoding="utf-8"))
+        disk["web_watch"]["port"] = 8755
+        disk["web_watch"]["dry_run"] = True
+        Path(config.path).write_text(json.dumps(disk, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 用户只动了「语音朗读」→ 关掉，然后保存
+        dialog.ww_speak_check.setChecked(False)
+        page.save_web_watch_settings(dialog)
+
+        after = json.loads(Path(config.path).read_text(encoding="utf-8"))["web_watch"]
+        assert after["speak_enabled"] is False, "用户改过的字段必须生效"
+        assert after["port"] == 8755, "没碰过的端口必须服从磁盘最新值，不能被回滚成 8765"
+        assert after["dry_run"] is True, "没碰过的模式同理"
+    finally:
+        dialog.deleteLater()
+
+
+def test_settings_save_applies_fields_the_user_changed(tmp_path):
+    """碰过的字段以界面为准（对照组，防止上面的修复矫枉过正）。"""
+    from pet import settings_web_watch as page
+
+    config = Config(base=tmp_path)
+    cfg = dict(config.get("web_watch") or {})
+    cfg.update({"enabled": True, "port": 8765})
+    config.set("web_watch", cfg)
+    assert config.save()
+    dialog = _FakeDialog(config)
+    try:
+        page.create_web_watch_controls(dialog)
+        dialog.ww_port_spin.setValue(9310)
+        dialog.ww_dwell_spin.setValue(42)
+        page.save_web_watch_settings(dialog)
+        after = json.loads(Path(config.path).read_text(encoding="utf-8"))["web_watch"]
+        assert after["port"] == 9310
+        assert after["dwell_seconds"] == 42
+    finally:
+        dialog.deleteLater()
 
 
 # ---------------------------------------------------------------- 设置页契约
