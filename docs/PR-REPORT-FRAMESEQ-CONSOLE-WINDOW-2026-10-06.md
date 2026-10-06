@@ -10,8 +10,7 @@
 控制台窗口，标题就是 ffmpeg 的完整路径：
 
 ```
-D:\Users\七颜\AppData\Local\Programs\dsh-pet-standalone-webm-chat
-  \_internal\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe
+<安装目录>\_internal\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe
 ```
 
 **根因**（实机进程链证据，见 §四）：`pet/frameseq_provision.py` 的阶段一编码

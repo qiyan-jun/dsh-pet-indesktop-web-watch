@@ -122,7 +122,7 @@
 
 ## 五、实机运行记录
 
-**环境**：真实 Windows 桌面 + 已安装产物（`D:\Users\七颜\AppData\Local\Programs\dsh-pet-standalone-webm-chat`，v4.2.1），进程 pid 10848，日志 `%APPDATA%\dsh-pet-standalone-webm-chat\pet-10848.log`。
+**环境**：真实 Windows 桌面 + 已安装产物（`<安装目录>`，v4.2.1），进程 pid 10848，日志 `%APPDATA%\dsh-pet-standalone-webm-chat\pet-10848.log`。
 
 1. **构建与部署**：`scripts/build_onedir.ps1 -Variant webm-chat`（本机 PS 5.1 解析中文脚本会乱码，用同目录 UTF-8 BOM 临时副本执行）→ 冒烟全绿（DLL 链/中文编码/瘦身/exe 起窗/`--settings` 起窗），产物 261.7 MB；`Copy-Item` 覆盖安装目录（保留 `unins000.*`），备份在 `D:\deepseekHarness\dsh-pet-install-backup-20261006-110919`（274.2 MB）。
 2. **服务自启**：日志 `web_watch: 本地接收端已启动 http://127.0.0.1:8765` + `已启用（端口 8765，dry-run）`；令牌文件 `web_watch_token.txt`（32 位）自动生成。
