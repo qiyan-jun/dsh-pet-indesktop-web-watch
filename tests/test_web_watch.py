@@ -139,9 +139,9 @@ def test_excerpt_collapses_whitespace_and_caps_length():
     [
         ({"dwell_seconds": -5}, "dwell_seconds", 0),
         ({"dwell_seconds": 9999}, "dwell_seconds", 600),
-        ({"cooldown_minutes": 0.1}, "cooldown_minutes", 0.5),
+        ({"cooldown_minutes": 0.05}, "cooldown_minutes", 0.1),
         ({"daily_cap": 0}, "daily_cap", 1),
-        ({"min_request_interval_seconds": 1}, "min_request_interval_seconds", 30),
+        ({"min_request_interval_seconds": 1}, "min_request_interval_seconds", 10),
         ({"port": 70000}, "port", 65535),
         ({"dwell_seconds": "abc"}, "dwell_seconds", 8),
         ({"unknown_key": 1}, "unknown_key", None),

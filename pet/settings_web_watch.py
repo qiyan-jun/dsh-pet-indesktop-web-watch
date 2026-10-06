@@ -36,10 +36,10 @@ from .settings_widgets import BrowserDoubleSpinBox, BrowserSpinBox, SettingRow, 
 _RANGE_DWELL = (0, 600)
 _RANGE_DELTA = (80, 20000)
 _RANGE_IDLE = (0, 3600)
-_RANGE_COOLDOWN = (0.5, 120.0)
+_RANGE_COOLDOWN = (0.1, 120.0)
 _RANGE_PORT = (1, 65535)
 _RANGE_CAP = (1, 9999)
-_RANGE_MIN_INTERVAL = (30, 3600)
+_RANGE_MIN_INTERVAL = (10, 3600)
 
 TOKEN_FILE_NAME = "web_watch_token.txt"
 STATE_FILE_NAME = "web_watch_state.json"
@@ -239,6 +239,7 @@ def create_web_watch_controls(dialog) -> None:
         ("ww_speak_check", "speak_enabled"),
         ("ww_idle_check", "require_idle"),
         ("ww_agent_busy_check", "pause_when_agent_busy"),
+        ("ww_precue_check", "pre_cue"),
         ("ww_verbose_check", "verbose_log"),
     ):
         switch = ToggleSwitch(dialog)
@@ -332,6 +333,7 @@ def build_web_watch_rows(dialog) -> list[SettingRow]:
         SettingRow("web_watch_video", "视频点评", "视频播放到设定时刻时评论一次（标题 + 进度）。", dialog.ww_video_check),
         SettingRow("web_watch_suggest", "主动建议", "在代码/文档/论文/新闻/问答页停留且你离开键鼠一段时间后，给一条具体建议（每页最多一条）。", dialog.ww_suggest_check),
         SettingRow("web_watch_speak", "语音朗读", "把评论用语音报时的音色读出来（与报时共用通道）。", dialog.ww_speak_check),
+        SettingRow("web_watch_precue", "先说一句「让我看看……」", "命中后立刻给个反馈气泡，再等模型答复（模型往返通常 1~19 秒，先有动静体感快很多）。", dialog.ww_precue_check),
         SettingRow("web_watch_dwell", "换页停留门限", "同一页停留多久才可能开口（0 = 立即）。", dialog.ww_dwell_spin),
         SettingRow("web_watch_delta", "正文增量阈值", "长文/文档页新增这么多字才再补一句，防止刷屏。", dialog.ww_delta_spin),
         SettingRow("web_watch_video_moment", "视频首句时刻", "视频播放到这个时间点才评论（避免一开场就说话）。", dialog.ww_video_moment_spin),
@@ -340,8 +342,8 @@ def build_web_watch_rows(dialog) -> list[SettingRow]:
         SettingRow("web_watch_verbose", "详细日志", "把「收到事件 / 为什么没说话 / 是否发出请求」写进 pet 日志。排查问题时就靠它。", dialog.ww_verbose_check),
         SettingRow("web_watch_idle_seconds", "闲置判定秒数", "勾选上一项后，键鼠静止该秒数才开口。", dialog.ww_idle_spin),
         SettingRow("web_watch_suggest_idle", "建议的闲置秒数", "离开键鼠多久后给建议（默认 45 秒）。", dialog.ww_suggest_idle_spin),
-        SettingRow("web_watch_cooldown", "全局冷却", "两次说话之间的最短间隔，跨页面全局生效。", dialog.ww_cooldown_spin),
-        SettingRow("web_watch_min_interval", "最小请求间隔", "免费模型档的硬保护，不建议调太小。", dialog.ww_min_interval_spin),
+        SettingRow("web_watch_cooldown", "同页冷却", "同一页两次说话之间的最短间隔；换到新页面不受它限制（新页由「最小请求间隔」兜底）。", dialog.ww_cooldown_spin),
+        SettingRow("web_watch_min_interval", "最小请求间隔", "跨页面的硬保护：两次真正调用模型之间至少隔这么久（免费档防限流），不建议小于 10 秒。", dialog.ww_min_interval_spin),
         SettingRow("web_watch_cap", "每日上限", "每天最多真正调用模型多少次；到达后当日不再说话。", dialog.ww_cap_spin),
         SettingRow("web_watch_blacklist", "不互动的网站", "一行一个域名；支持 example.com 匹配其子域。", dialog.ww_blacklist_edit, stacked=True),
         SettingRow("web_watch_whitelist", "只在指定网站互动", "留空 = 全部网站；填了则只在这些域名生效。", dialog.ww_whitelist_edit, stacked=True),
@@ -361,6 +363,7 @@ def _collect_widgets(dialog) -> dict:
         "video_enabled": bool(dialog.ww_video_check.isChecked()),
         "suggest_enabled": bool(dialog.ww_suggest_check.isChecked()),
         "speak_enabled": bool(dialog.ww_speak_check.isChecked()),
+        "pre_cue": bool(dialog.ww_precue_check.isChecked()),
         "require_idle": bool(dialog.ww_idle_check.isChecked()),
         "pause_when_agent_busy": bool(dialog.ww_agent_busy_check.isChecked()),
         "verbose_log": bool(dialog.ww_verbose_check.isChecked()),

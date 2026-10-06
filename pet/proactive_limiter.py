@@ -183,6 +183,8 @@ class ProactiveLimiter:
         dry_run: bool = False,
         clock: Callable[[], float] = time.time,
         today: Callable[[], str] | None = None,
+        min_interval_floor: float = 30.0,
+        cooldown_floor: float = 0.5,
     ) -> None:
         self.raw_state_path = Path(state_path)
         self.dry_run = dry_run
@@ -191,13 +193,38 @@ class ProactiveLimiter:
             self.state_path = self.raw_state_path.with_name("proactive_screen_dryrun_state.json")
         else:
             self.state_path = self.raw_state_path
-        self.cfg = effective_proactive_config(cfg)
+        # 两道下限可注入：默认值 = 主动识屏手册 §2 的免费视觉模型硬下限（行为不变）；
+        # web_watch 传更小的下限——它用短文本请求、且换页免冷却，30s 硬地板会让用户
+        # 明确感到迟钝（实测：配置 12s 被这里顶回 30s）。
+        self._min_interval_floor = float(min_interval_floor)
+        self._cooldown_floor = float(cooldown_floor)
+        self.cfg = self._effective_config(cfg)
         self._clock = clock
         self._today_fn = today or (lambda: datetime.date.today().isoformat())
 
+    def _effective_config(self, cfg: dict | None) -> dict[str, Any]:
+        """共享 clamp + 本实例的下限覆盖（仅覆盖调用方显式给了值的两个键）。"""
+        eff = effective_proactive_config(cfg)
+        raw = cfg if isinstance(cfg, dict) else {}
+        try:
+            if raw.get("min_request_interval_seconds") is not None:
+                eff["min_request_interval_seconds"] = max(
+                    self._min_interval_floor, min(float(raw["min_request_interval_seconds"]), 3600.0)
+                )
+        except (TypeError, ValueError):
+            pass
+        try:
+            if raw.get("cooldown_minutes") is not None:
+                eff["cooldown_minutes"] = max(
+                    self._cooldown_floor, min(float(raw["cooldown_minutes"]), 120.0)
+                )
+        except (TypeError, ValueError):
+            pass
+        return eff
+
     def update_config(self, cfg: dict | None, dry_run: bool | None = None) -> None:
         """更新内部缓存的有效配置与 dry_run 模式。"""
-        self.cfg = effective_proactive_config(cfg)
+        self.cfg = self._effective_config(cfg)
         if dry_run is not None and dry_run != self.dry_run:
             self.dry_run = dry_run
             if self.dry_run:
@@ -329,7 +356,7 @@ class ProactiveLimiter:
             return False
         return True
 
-    def allow(self) -> tuple[bool, str]:
+    def allow(self, *, ignore_cooldown: bool = False) -> tuple[bool, str]:
         """判定当前是否允许发起主动识屏请求（跨进程加锁，判定期间状态不被并发改写）。
 
         规则判定顺序（手册 §4.3）：
@@ -340,12 +367,16 @@ class ProactiveLimiter:
         5. now - last_trigger < cooldown_minutes * 60 -> 拒绝（冷却中）；
         6. 否则放行。
 
+        ignore_cooldown: 跳过第 5 条（**只给 web_watch 的"换到新页面"用**：换页是用户
+        刚打开一页、最该立刻回应的时刻，而跨请求的防刷底线由第 4 条最小间隔兜住）。
+        默认 False，主动识屏行为完全不变。
+
         返回: (allowed: bool, reason: str)
         """
         with self._locked():
-            return self._allow_unlocked()
+            return self._allow_unlocked(ignore_cooldown=ignore_cooldown)
 
-    def _allow_unlocked(self) -> tuple[bool, str]:
+    def _allow_unlocked(self, *, ignore_cooldown: bool = False) -> tuple[bool, str]:
         state = self._load_state()
         now = self._clock()
         current_today = self._today_fn()
@@ -362,18 +393,19 @@ class ProactiveLimiter:
         if (now - last_req) < min_req_interval:
             return False, "min_request_interval_cooldown"
 
-        cooldown_sec = float(self.cfg.get("cooldown_minutes", 5)) * 60.0
-        last_trig = float(state.get("last_trigger", 0.0))
-        if (now - last_trig) < cooldown_sec:
-            return False, "cooldown_active"
+        if not ignore_cooldown:
+            cooldown_sec = float(self.cfg.get("cooldown_minutes", 5)) * 60.0
+            last_trig = float(state.get("last_trigger", 0.0))
+            if (now - last_trig) < cooldown_sec:
+                return False, "cooldown_active"
 
         return True, "ok"
 
-    def try_acquire(self) -> tuple[bool, str]:
+    def try_acquire(self, *, ignore_cooldown: bool = False) -> tuple[bool, str]:
         """原子版 allow + record_attempt：判定与盖章在同一把锁内完成，
         多开实例不会同时通过判定后再互相覆盖 last_request（lost update）。"""
         with self._locked():
-            ok, reason = self._allow_unlocked()
+            ok, reason = self._allow_unlocked(ignore_cooldown=ignore_cooldown)
             if ok:
                 state = self._load_state()
                 state["last_request"] = self._clock()

@@ -30,7 +30,7 @@ from typing import Any, Callable
 from ..proactive_limiter import ProactiveLimiter
 from .digest import domain_of
 from .llm import WebWatchLlmError, post_text_request
-from .policy import ACTION_SUGGEST, Decision, Gates, WebWatchPolicy, effective_web_watch_config
+from .policy import ACTION_COMMENT, ACTION_SUGGEST, Decision, Gates, WebWatchPolicy, effective_web_watch_config
 from .prompts import build_messages, clean_reply
 from .server import DEFAULT_HOST, WebWatchServer
 
@@ -49,6 +49,9 @@ TICK_ACTIVE_MS = 1000
 TICK_IDLE_MS = 5000
 #: 频控拒绝后的本地退避秒数（见 _dispatch：避免 1Hz 反复锁频控状态文件）
 REFUSAL_BACKOFF_SECONDS = 10.0
+#: 频控两道下限（web_watch 专用，见 policy.effective_web_watch_config 的区间说明）
+LIMITER_MIN_INTERVAL_FLOOR = 10.0
+LIMITER_COOLDOWN_FLOOR = 0.1
 #: 状态快照写盘节流（秒）：事件可能密集，但没必要每次都落盘
 STATUS_WRITE_MIN_INTERVAL_S = 1.0
 
@@ -95,6 +98,9 @@ class WebWatchService:
         class _Bridge(QObject):
             # (文本, 展示时长 ms)：worker 线程 emit → GUI 线程槽
             bubble_requested = Signal(str, int)
+            # 事件到达（HTTP 线程 emit → GUI 线程立刻处理一次）：空闲时心跳退避到 5s，
+            # 若等下一次心跳才处理，用户会明显感到"慢半拍"（实测最多白等 5s）
+            event_arrived = Signal()
 
             def __init__(self, service: "WebWatchService", parent: Any = None) -> None:
                 super().__init__(parent)
@@ -102,6 +108,9 @@ class WebWatchService:
 
             def _forward_bubble(self, text: str, duration_ms: int) -> None:
                 self._service._show_bubble(text, duration_ms)
+
+            def _forward_event_arrived(self) -> None:
+                self._service._on_event_arrived()
 
         self.cfg = config
         self.target = target
@@ -118,9 +127,14 @@ class WebWatchService:
             config.get("web_watch", {}),
             dry_run=False,  # dry_run 由本服务解释，不复用识屏的 dry-run 状态文件
             clock=clock,
+            # 短文本请求 + 换页免冷却：把两道下限降到 web_watch 自己的区间，
+            # 否则共享 clamp 的 30s 硬地板会把用户配置的 12s 顶掉（实测）。
+            min_interval_floor=LIMITER_MIN_INTERVAL_FLOOR,
+            cooldown_floor=LIMITER_COOLDOWN_FLOOR,
         )
         self._bridge = _Bridge(self)
         self._bridge.bubble_requested.connect(self._bridge._forward_bubble)
+        self._bridge.event_arrived.connect(self._bridge._forward_event_arrived)
         self._timer = QTimer()
         self._timer.setInterval(TICK_ACTIVE_MS)
         self._timer.timeout.connect(self._on_tick)
@@ -153,6 +167,15 @@ class WebWatchService:
         }
         self._logged_skip = ""
         self._status_written_at = 0.0
+        # 被频控暂时拦下的决定（保留"已决定"状态，冷却过后若还在同一页就补说）：
+        # 修复前是"release + 每秒重算"，日志里每秒一条"判定命中"，用户实际要等到
+        # 冷却窗口过期才听到声音——既慢又可能已经翻页。
+        self._pending_decision: Decision | None = None
+        self._pending_key = ""
+        self._pending_action = ""
+        # 最近一次真正派发出去的是哪一页：换页时用它判断"这是新页面"→ 免全局冷却
+        self._last_spoken_page_key = ""
+        self._last_wake_at = 0.0
         self._adopt_qt_lifetimes()
         self.apply_config()
 
@@ -313,6 +336,11 @@ class WebWatchService:
                 self._stats["last_event_selection_len"],
                 len(getattr(event, "headings", ()) or ()),
             )
+        # 立刻叫醒 GUI 线程处理一次：空闲时心跳退避到 5s，等下一次心跳才处理就是"慢半拍"
+        try:
+            self._bridge.event_arrived.emit()
+        except Exception:
+            log.debug("web_watch: 唤醒信号发送失败", exc_info=True)
 
     def _resolve_token(self, eff: dict) -> str:
         """令牌：配置里写了就用配置的；否则读/建用户目录下的令牌文件。"""
@@ -366,12 +394,30 @@ class WebWatchService:
                 busy = False
         return Gates(visible=visible, user_idle_seconds=idle, agent_busy=busy)
 
+    def _on_event_arrived(self) -> None:
+        """GUI 线程槽：事件一到就立刻处理一次（不赌下一次心跳）。
+
+        心跳在"页面已说完话"时会退避到 5s；若用户正快速翻页，等下次心跳就是白等几秒。
+        这里做两件事：把心跳拉回 1s，并立刻跑一次 tick。带 120ms 去抖，
+        避免扩展一次突发（滚动+划词+DOM 变化）触发多次密集 tick。
+        """
+        if not self._eff["enabled"]:
+            return
+        now = self._clock()
+        if self._timer.interval() != TICK_ACTIVE_MS:
+            self._timer.setInterval(TICK_ACTIVE_MS)
+        if now - self._last_wake_at < 0.12:
+            return
+        self._last_wake_at = now
+        self._on_tick()
+
     def _on_tick(self) -> None:
         """GUI 线程心跳：消费事件 → 时间驱动判定 → 派发生成。"""
         if not self._eff["enabled"]:
             return
         now = self._clock()
         gates = self._gates()
+        self._retry_pending(now, gates)
         processed = 0
         while self._events and processed < MAX_EVENTS_PER_TICK:
             processed += 1
@@ -382,14 +428,32 @@ class WebWatchService:
                 self._dispatch(decision, now)
             else:
                 self._note_skip(self._policy.last_skip_reason)
-        decision = self._policy.poll(gates, now)
-        if decision is not None:
-            self._note_decision(decision, now)
-            self._dispatch(decision, now)
-        else:
-            self._note_skip(self._policy.last_skip_reason)
+        if self._pending_decision is None:  # 已有待补说的决定时不再叠加新的时间驱动判定
+            decision = self._policy.poll(gates, now)
+            if decision is not None:
+                self._note_decision(decision, now)
+                self._dispatch(decision, now)
+            else:
+                self._note_skip(self._policy.last_skip_reason)
         self._retune_interval()
         self._write_status()
+
+    def _retry_pending(self, now: float, gates: Gates) -> None:
+        """冷却过后补说被拦下的那一条；页面已经换了就丢弃（不说过期内容）。"""
+        pending = self._pending_decision
+        if pending is None or now < self._retry_after:
+            return
+        self._pending_decision = None
+        page_key = self._policy.page_key()
+        if not page_key or page_key != self._pending_key:
+            self._policy.release(pending)
+            self._note_dispatch("dropped", "冷却结束时页面已经换了，丢弃这条待说内容")
+            return
+        if not gates.visible:
+            self._policy.release(pending)
+            self._note_dispatch("dropped", "冷却结束时桌宠不可见，丢弃")
+            return
+        self._dispatch(pending, now, retry=True)
 
     def _note_decision(self, decision: Decision, now: float) -> None:
         """记下"策略层判定了要说话"（第二问：什么时候开始处理的）。"""
@@ -466,17 +530,29 @@ class WebWatchService:
 
     # ---- 生成与呈现 ----------------------------------------------------
 
-    def _dispatch(self, decision: Decision, now: float) -> None:
-        """频控 + 单飞检查后派发后台生成；被拒时回滚策略标记。
+    def _dispatch(self, decision: Decision, now: float, *, retry: bool = False) -> None:
+        """频控 + 单飞检查后派发后台生成。
 
         每一处 return 都要留痕（`_stats["last_dispatch"]` + 日志）：用户排查第三问
-        （"读完了到底有没有上传处理"）时，这里要能明确回答"卡在哪一步"，
-        而不是只看到"什么都没发生"。
+        （"读完了到底有没有上传处理"）时，这里要能明确回答"卡在哪一步"。
+
+        **换页免冷却**（实测：新页面被 30s 全局冷却压住 30 秒才说话，用户明确感到迟钝）：
+        当这一条属于"用户刚换到的另一页"时，只受最小请求间隔约束（跨请求防刷底线），
+        冷却本身留着管"同一页别刷屏"。
+
+        **被拦不丢、不过期**：拦下时保留决定（`_pending_decision`），冷却过后若用户
+        还在这一页就补说；已经翻页则丢弃。修复前是每秒重算一次直到窗口过期。
         """
+        page_key = self._policy.page_key()
         if self._request_in_flight:
-            self._policy.release(decision)
+            if not retry:
+                self._policy.release(decision)
             self._note_dispatch("in_flight", f"上一条还在生成中，本条回滚（{decision.reason}）")
             return
+        # 已经有别的待补说页面 → 以新的为准（用户已经翻走了）
+        if self._pending_decision is not None and self._pending_key and self._pending_key != page_key:
+            self._policy.release(self._pending_decision)
+            self._pending_decision = None
         if self._eff["dry_run"]:
             self._stats["dry_run_hits"] += 1
             self._stats["last_reason"] = f"dry_run:{decision.reason}"
@@ -488,20 +564,23 @@ class WebWatchService:
                 domain_of(decision.digest.get("url", "")),
             )
             return
-        if now < self._retry_after:
-            # 刚被频控拒过：先退避，别用 1Hz 的文件锁去问同一件已知答案的事
-            self._policy.release(decision)
+        if now < self._retry_after and not retry:
             self._note_dispatch("backoff", f"频控退避中（还剩 {self._retry_after - now:.0f}s）")
             return
-        allowed, reason = self.limiter.try_acquire()
+        is_new_page = bool(page_key) and page_key != self._last_spoken_page_key
+        allowed, reason = self.limiter.try_acquire(
+            ignore_cooldown=is_new_page and decision.action == ACTION_COMMENT
+        )
         if not allowed:
-            self._policy.release(decision)
+            self._pending_decision = decision
+            self._pending_key = page_key
             self._retry_after = now + REFUSAL_BACKOFF_SECONDS
             self._stats["last_reason"] = f"rate_limited:{reason}"
-            self._note_dispatch("rate_limited", f"频控拦下：{reason}")
-            log.info("web_watch: 频控拦下（%s），%.0fs 后再试", reason, REFUSAL_BACKOFF_SECONDS)
+            self._note_dispatch("rate_limited", f"频控拦下（{reason}），已记住这条，冷却后补说")
+            log.info("web_watch: 频控拦下（%s），记住这条内容，%.0fs 后还在这页就补说", reason, REFUSAL_BACKOFF_SECONDS)
             return
         self._retry_after = 0.0
+        self._pending_decision = None
         try:
             provider, persona = self._resolve_provider()
         except Exception as exc:
@@ -511,6 +590,12 @@ class WebWatchService:
             self._note_dispatch("provider_error", f"provider 解析失败：{exc}")
             log.warning("web_watch: provider 解析失败 %s", exc)
             return
+
+        if is_new_page:
+            self._last_spoken_page_key = page_key
+        # 先兆气泡：模型往返中位 4s、最差 19s，先给一句反馈再等答复
+        if self._eff.get("pre_cue", True):
+            self._show_bubble("让我看看……", 2500, speak=False, hold=False)
 
         import threading
 
@@ -597,21 +682,25 @@ class WebWatchService:
         finally:
             self._request_in_flight = False
 
-    def _show_bubble(self, text: str, duration_ms: int) -> None:
-        """GUI 线程：冒泡（+可选语音）。扇出面由注入的 target 决定（多窗代理）。"""
-        hold = getattr(self.target, "hold_bubble", None)
-        if callable(hold):
-            try:
-                hold(duration_ms / 1000.0 + 2.0)
-            except Exception:
-                log.debug("web_watch: hold_bubble 失败", exc_info=True)
+    def _show_bubble(self, text: str, duration_ms: int, *, speak: bool = True, hold: bool = True) -> None:
+        """GUI 线程：冒泡（+可选语音）。扇出面由注入的 target 决定（多窗代理）。
+
+        speak/hold 供"先兆气泡"用：那句话只占住气泡位、不朗读，也不额外压长占用时间。
+        """
+        if hold:
+            hold_fn = getattr(self.target, "hold_bubble", None)
+            if callable(hold_fn):
+                try:
+                    hold_fn(duration_ms / 1000.0 + 2.0)
+                except Exception:
+                    log.debug("web_watch: hold_bubble 失败", exc_info=True)
         show = getattr(self.target, "show_bubble", None)
         if callable(show):
             try:
                 show(text, duration_ms=duration_ms)
             except Exception:
                 log.warning("web_watch: 冒泡失败", exc_info=True)
-        if self._eff.get("speak_enabled") and callable(self.on_speak):
+        if speak and self._eff.get("speak_enabled") and callable(self.on_speak):
             try:
                 self.on_speak(text)
             except Exception:

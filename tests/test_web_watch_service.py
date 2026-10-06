@@ -254,7 +254,9 @@ def test_service_end_to_end_bubbles_once_then_rate_limits(tmp_path, monkeypatch)
         return "这仓库的 README 写得挺实在"
 
     monkeypatch.setattr(service_mod, "post_text_request", _fake_request)
-    service, fake, _cfg = _service(tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10)
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
     try:
         port = service.status()["port"]
         assert _post_to(service, _page())[0] == 204
@@ -352,7 +354,11 @@ def test_rate_limit_refusal_backs_off_instead_of_polling_every_tick(tmp_path, mo
     calls: list[int] = []
     service, fake, _cfg = _service(tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10)
     try:
-        monkeypatch.setattr(service.limiter, "try_acquire", lambda: (calls.append(1), (False, "daily_cap_reached"))[1])
+        monkeypatch.setattr(
+            service.limiter,
+            "try_acquire",
+            lambda **kwargs: (calls.append(1), (False, "daily_cap_reached"))[1],
+        )
         assert _post_to(service, _page())[0] == 204
         _pump(3.0)
         assert len(calls) == 1, f"退避期内不得反复询问频控（实际 {len(calls)} 次）"
@@ -563,6 +569,145 @@ def test_settings_save_applies_fields_the_user_changed(tmp_path):
         assert after["dwell_seconds"] == 42
     finally:
         dialog.deleteLater()
+
+
+def test_new_page_bypasses_page_cooldown(tmp_path, monkeypatch):
+    """换到新页面时必须请求"跳过同页冷却"（实测：新页被 30s 冷却压住 → 用户觉得迟钝）。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "评论")
+    service, _fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False, cooldown_minutes=0.5
+    )
+    seen: list[bool] = []
+    real_try = service.limiter.try_acquire
+
+    def spy(**kwargs):
+        seen.append(bool(kwargs.get("ignore_cooldown")))
+        return real_try(**kwargs)
+
+    try:
+        monkeypatch.setattr(service.limiter, "try_acquire", spy)
+        assert _post_to(service, _page(url="https://a.example/x"))[0] == 204
+        assert _wait_until(lambda: seen, timeout=8.0)
+        assert seen[0] is True, "第一页就该免同页冷却"
+        # 换到 B 页：即便同页冷却（30s）还没过，也必须带 ignore_cooldown=True 去问
+        assert _post_to(service, _page(url="https://b.example/y", title="B页"))[0] == 204
+        assert _wait_until(lambda: len(seen) >= 2, timeout=8.0)
+        assert seen[-1] is True, "换到新页面必须跳过同页冷却"
+    finally:
+        service.stop()
+
+
+def test_rate_limited_decision_is_remembered_and_retried(tmp_path, monkeypatch):
+    """被频控拦下时不丢、也不每秒重算：记住这条，退避后再补说。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "补说的评论")
+    monkeypatch.setattr(service_mod, "REFUSAL_BACKOFF_SECONDS", 2.0)
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
+    calls: list[int] = []
+    allow = {"value": False}
+
+    def gated(**kwargs):
+        calls.append(1)
+        return (True, "ok") if allow["value"] else (False, "cooldown_active")
+
+    try:
+        monkeypatch.setattr(service.limiter, "try_acquire", gated)
+        assert _post_to(service, _page())[0] == 204
+        assert _wait_until(lambda: len(calls) == 1, timeout=8.0)
+        _pump(0.9)
+        assert len(calls) == 1, "退避期内不得反复询问频控（修复前是 1Hz 重算）"
+        assert fake.bubbles == []
+        assert service.status()["last_dispatch"].startswith("rate_limited")
+        # 放行后：不必等用户再操作，退避到点就补说这一条
+        allow["value"] = True
+        assert _wait_until(lambda: bool(fake.bubbles), timeout=8.0), "冷却结束后应自动补说"
+        assert fake.bubbles == ["补说的评论"]
+    finally:
+        service.stop()
+
+
+def test_pending_decision_dropped_when_user_moved_on(tmp_path, monkeypatch):
+    """冷却结束时用户已经离开那一页 → 丢弃待说内容（不说过期的话）。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "不该出现")
+    monkeypatch.setattr(service_mod, "REFUSAL_BACKOFF_SECONDS", 1.0)
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
+    allow = {"value": False}
+    try:
+        monkeypatch.setattr(
+            service.limiter,
+            "try_acquire",
+            lambda **kwargs: (True, "ok") if allow["value"] else (False, "cooldown_active"),
+        )
+        assert _post_to(service, _page(url="https://a.example/one"))[0] == 204
+        assert _wait_until(lambda: "rate_limited" in service.status()["last_dispatch"], timeout=8.0)
+        # 用户翻页走了（页身份被清空）→ 退避到点时应丢弃这条待说内容
+        service._policy.reset()
+        allow["value"] = True
+        assert _wait_until(lambda: service.status()["last_dispatch"].startswith("dropped"), timeout=8.0)
+        assert fake.bubbles == []
+    finally:
+        service.stop()
+
+
+def test_event_arrival_wakes_idle_timer(tmp_path, monkeypatch):
+    """事件到达要立刻处理：空闲退避到 5s 时，不能白等下一次心跳。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "评论")
+    service, _fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
+    try:
+        _pump(1.0)
+        service._retune_interval()
+        assert service._timer.interval() == service_mod.TICK_IDLE_MS, "还没有页面时是 5s 空闲心跳"
+        before = service.status()["received"]
+        assert _post_to(service, _page())[0] == 204
+        assert _wait_until(lambda: service.status()["received"] == before + 1, timeout=3.0)
+        assert service._timer.interval() == service_mod.TICK_ACTIVE_MS, "事件到达应把心跳拉回 1s"
+    finally:
+        service.stop()
+
+
+def test_pre_cue_bubble_shows_before_reply(tmp_path, monkeypatch):
+    """开了「先说一句」时，先冒"让我看看……"再等模型（体感延迟）。"""
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "真正的评论")
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=True
+    )
+    try:
+        assert _post_to(service, _page())[0] == 204
+        assert _wait_until(lambda: len(fake.bubbles) >= 2, timeout=10.0)
+        assert fake.bubbles[0] == "让我看看……"
+        assert fake.bubbles[-1] == "真正的评论"
+    finally:
+        service.stop()
+
+
+def test_limiter_floors_are_lowered_for_web_watch(tmp_path):
+    """频控下限必须按 web_watch 的区间走。
+
+    实测缺陷：`ProactiveLimiter` 内部用共享的 `effective_proactive_config`，其中
+    `min_request_interval_seconds` 硬地板是 30s（主动识屏给免费视觉模型定的）。
+    web_watch 配 12s 会被顶回 30s —— 换页时仍然"慢半拍"。这里钉死下限可注入，
+    同时保证主动识屏的默认下限（30s / 0.5 分）没被动过。
+    """
+    from pet.proactive_limiter import ProactiveLimiter
+
+    service, _fake, config = _service(
+        tmp_path, enabled=True, port=0, min_request_interval_seconds=12, cooldown_minutes=0.5
+    )
+    try:
+        assert service.limiter.cfg["min_request_interval_seconds"] == 12
+        assert abs(service.limiter.cfg["cooldown_minutes"] - 0.5) < 1e-9
+    finally:
+        service.stop()
+
+    # 主动识屏（不传下限）：仍按手册的 30s / 0.5 分钳制
+    legacy = ProactiveLimiter(config.dir / "legacy_state.json", {"min_request_interval_seconds": 12, "cooldown_minutes": 0.1})
+    assert legacy.cfg["min_request_interval_seconds"] == 30
+    assert abs(legacy.cfg["cooldown_minutes"] - 0.5) < 1e-9
 
 
 # ---------------------------------------------------------------- 设置页契约

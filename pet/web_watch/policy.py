@@ -58,14 +58,17 @@ DEFAULT_WEB_WATCH_CONFIG: dict[str, Any] = {
     "suggest_idle_seconds": 45.0,
     "suggest_min_text_chars": 200,
     "speak_enabled": False,
+    # 派发瞬间先冒一句"让我看看……"：模型往返中位 4s、最差 19s，先给反馈能把
+    # 感知延迟砍掉一大截（与主动识屏的 pre_cue 同一招）
+    "pre_cue": True,
     # 流水线可见性：把"收到事件/跳过原因/派发结论"写进日志与状态快照。
     # 默认开——这是用户排查"为什么没反应"的唯一入口，噪音很低（跳过原因只在变化时打）。
     "verbose_log": True,
-    "cooldown_minutes": 2.0,
+    "cooldown_minutes": 0.5,
     "daily_cap": 60,
-    "min_request_interval_seconds": 30,
+    "min_request_interval_seconds": 15,
     "max_comment_chars": 40,
-    "excerpt_chars": 1200,
+    "excerpt_chars": 600,
 }
 
 #: 数值键 → (默认值, 最小, 最大)；与 ProactiveLimiter 的有效区间对齐，
@@ -78,12 +81,14 @@ _INT_RANGES: dict[str, tuple[int, int, int]] = {
     "min_idle_seconds": (20, 0, 3600),
     "min_selection_chars": (4, 1, 200),
     "daily_cap": (60, 1, 9999),
-    "min_request_interval_seconds": (30, 30, 3600),
+    # 下限收到 10s：换页是"最该立刻回应"的时刻，30s 硬地板会让用户明确感到迟钝
+    "min_request_interval_seconds": (15, 10, 3600),
     "max_comment_chars": (40, 8, 200),
-    "excerpt_chars": (1200, 200, 6000),
+    "excerpt_chars": (600, 200, 6000),
 }
 _FLOAT_RANGES: dict[str, tuple[float, float, float]] = {
-    "cooldown_minutes": (2.0, 0.5, 120.0),
+    # 下限收到 0.1 分（6s）：冷却只用于"同一页别刷屏"，跨页由最小间隔兜底
+    "cooldown_minutes": (0.5, 0.1, 120.0),
     "video_first_moment_seconds": (20.0, 0.0, 3600.0),
     "suggest_min_dwell_seconds": (25.0, 0.0, 3600.0),
     "suggest_idle_seconds": (45.0, 0.0, 3600.0),
@@ -99,6 +104,7 @@ _BOOL_KEYS = (
     "suggest_enabled",
     "speak_enabled",
     "verbose_log",
+    "pre_cue",
 )
 _LIST_KEYS = ("whitelist", "blacklist")
 
@@ -439,6 +445,10 @@ class WebWatchPolicy:
     def page_kind(self) -> str:
         """当前页类型（设置页展示用）。"""
         return self._page_kind()
+
+    def page_key(self) -> str:
+        """当前页身份（无查询串的 URL）；服务层用它判断"是不是换到了新页面"。"""
+        return self._key
 
     # ---- 频控拒绝回滚 --------------------------------------------------
 

@@ -18,10 +18,15 @@ from typing import Any, Callable
 
 log = logging.getLogger("dsh-pet-standalone")
 
-#: 短评不需要长输出；太小又可能被推理 token 吃掉，取 512 留余量
-DEFAULT_MAX_TOKENS = 512
-#: 网络超时下限（与 vision 同口径：免费档高峰较慢）
-MIN_TIMEOUT_SECONDS = 60.0
+#: 短评不需要长输出；太大反而拖慢生成（实测模型往返中位 4s、最差 19s）。
+#: 40 字评论 + 少量余量即可，取 192 留出推理模型偶尔的思考 token。
+DEFAULT_MAX_TOKENS = 192
+#: 单次请求超时下限。实测免费档偶发卡住（>36s 无响应）：原来 60s × 3 次重试
+#: = 最长静默 3 分钟，用户体感就是"它死了"。收到 30s 并只重试 1 次（共 2 次尝试），
+#: 卡住的请求快速失败，不阻塞后续页面的互动。
+MIN_TIMEOUT_SECONDS = 30.0
+#: 最多尝试次数（含首次）
+MAX_ATTEMPTS = 2
 
 
 class WebWatchLlmError(RuntimeError):
@@ -76,7 +81,7 @@ def post_text_request(
         "messages": messages,
         "stream": False,
         "temperature": provider.temperature,
-        "max_tokens": max(64, min(int(max_tokens), 2048)),
+        "max_tokens": max(64, min(int(max_tokens), 1024)),
     }
     model_name = str(payload["model"] or "")
     base_url = str(provider.base_url or "")
@@ -96,7 +101,7 @@ def post_text_request(
     effective_timeout = max(float(timeout or getattr(provider, "timeout", 0) or 0), MIN_TIMEOUT_SECONDS)
     data: Any = None
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(MAX_ATTEMPTS):
         if consume_budget is not None and not consume_budget():
             raise WebWatchLlmError("今天的网页互动额度用完了")
         try:
@@ -119,7 +124,7 @@ def post_text_request(
             raise WebWatchLlmError(_detail(raw)) from exc
         except (urllib.error.URLError, OSError) as exc:
             last_error = exc
-        if attempt < 2:
+        if attempt < MAX_ATTEMPTS - 1:
             time.sleep(1.0)
     if data is None:
         if isinstance(last_error, urllib.error.HTTPError):
