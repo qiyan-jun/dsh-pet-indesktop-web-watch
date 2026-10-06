@@ -161,14 +161,14 @@ ffmpeg 12552 MainWindowHandle = 395908（非 0 = 有可见窗口）
 
 ## 五、测试与验证到什么程度
 
-- **全量测试**：`python -m pytest -q` → **4364 passed / 14 skipped**（在提速改动那一版上跑满 12 分 45 秒）；
-  随后仅追加了 frameseq 黑窗修复与其回归用例，聚焦族 `tests/test_frameseq_provision.py` 等 **140 passed**、
-  交付证据纪律用例 **67 passed**、`ruff check pet tests` 全绿；
+- **全量测试**：`python -m pytest -q` → **4367 passed / 14 skipped，exit 0**（在包含本文档所述全部改动的
+  提交上跑满 12 分 23 秒，2026-10-06）；其中 `ruff check pet tests` 全绿；
 - **新增回归用例**：网页互动 60+ 条（触发策略、频控、隐私脱敏、端口自愈、设置页不回滚、唤醒与补说）、
-  黑窗 1 条（`test_creation_flags_hide_console_window`，该缺陷在 CI 无法行为复现，只钉标志位）；
+  黑窗 1 条（`test_creation_flags_hide_console_window`，该缺陷在 CI 无法行为复现，只钉标志位）、
+  交付证据纪律用例 67 条（报告三章节 + 索引登记）；
 - **性能实测**：空闲 CPU 0.156%（单核占比）、HTTP `p50 1.11ms / p95 1.59ms`（n=200）、常驻内存增量 +0.07MB；
 - **实机验证**：全程在一台真实 Windows 机器上通过「真扩展 + 真 Edge + 真桌宠 + 真模型」跑通，
-  评论内容与页面内容的相关性可直接对照日志。
+  评论内容与页面内容的相关性可直接对照日志；黑窗修复另做了 A/B 与部署后盯窗 90 秒（见第四节）。
 
 ## 六、已知问题与未做的部分（如实登记）
 
