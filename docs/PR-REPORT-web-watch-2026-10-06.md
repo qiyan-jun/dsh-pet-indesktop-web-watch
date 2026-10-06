@@ -239,3 +239,69 @@ Service Worker（生产路径）与候选端口——否则端口不一致会被
   `web_watch` 域）；同类问题若在别处复现，可按同一招（打开快照 + 未改动则取磁盘最新值）处理。
 - `apply_config` 的"停用"分支没有日志（只有启用时打一行），排查"功能为什么自己关了"时少一条线索。**未修**。
 
+## 十、第三轮：反应速度（2026-10-06 傍晚）
+
+用户反馈"反应还是有点慢"。全部结论都基于**运行中桌宠的真实日志时间戳**，不是估算。
+
+### 10.1 实测拆解（改动前，8 条真实回复样本）
+
+| 阶段 | 实测 |
+| --- | --- |
+| 事件到达 → 判定命中 | 0 ~ **5s**（页面说完话后心跳退避到 5s，新页面白等） |
+| 判定命中 → 派发 | 通常 0s，**最差 30s**（全局冷却把"新页面"一起拦下；被拦时每秒重算一次直到窗口过期） |
+| 派发 → 回复（模型往返） | 中位 **3.98s**，最快 0.86s，最慢 **18.85s**，另有 >36s 卡住无响应 |
+| 典型端到端 | ~4s；最差 ~25s；卡住时最长静默可达 **3 分钟**（60s 超时 × 3 次尝试） |
+
+改造前的现场（日志原文）：
+```
+13:59:31 判定命中：comment（page_dwell，站点 127.0.0.1）
+13:59:32 判定命中：…（同一页，每秒一条）
+…
+13:59:44 派发模型请求：comment/page_dwell 站点=127.0.0.1   ← 冷却窗口过期才真正发出
+```
+
+### 10.2 本轮的七处改动
+
+| # | 改动 | 位置 |
+| --- | --- | --- |
+| 1 | **事件到达即唤醒**：HTTP 线程发 Qt 信号，GUI 立刻处理并把心跳拉回 1s（带 120ms 去抖） | `service.py` `_enqueue_event` / `_on_event_arrived` |
+| 2 | **新页面免同页冷却**：换页只受最小请求间隔约束；同页仍受冷却管 | `service.py` `_dispatch` + `ProactiveLimiter.try_acquire(ignore_cooldown=)` |
+| 3 | **频控下限可按功能注入**：web_watch 10s / 0.1 分，主动识屏保持 30s / 0.5 分（共享 clamp 曾把配置的 12s 顶回 30s） | `proactive_limiter.py` `min_interval_floor` / `cooldown_floor` |
+| 4 | **被拦不丢、不过期**：记住这条决定，退避后仍在本页就补说、已翻页则丢弃 | `service.py` `_pending_decision` / `_retry_pending` |
+| 5 | **先兆气泡**：派发瞬间冒「让我看看……」（不朗读、不占时长），配置项 `pre_cue` 默认开 | `service.py` `_show_bubble(..., speak=False)` |
+| 6 | **更短的请求**：正文摘录默认 1200 → **600 字**；`max_tokens` 512 → **192** | `policy.py` / `config.py` / `llm.py` |
+| 7 | **卡住快速失败**：单次超时下限 60 → **30s**，尝试 3 → **2** 次 | `llm.py` |
+
+### 10.3 实测拆解（改动后）
+
+| 阶段 | 改动后 |
+| --- | --- |
+| 事件到达 → 判定命中 | **0.000 ~ 0.002s** |
+| 判定命中 → 派发 | **0.008 ~ 0.111s**（连续两页都不再被频控拦） |
+| 派发 → 回复 | 0.885s（本轮样本；仍随免费档波动） |
+| **端到端（事件 → 冒泡）** | **0.998s**（= 0.002 + 0.111 + 0.885） |
+
+日志原文（会话 `pet-11100`）：
+```
+14:23:21.594 收到事件 #1 kind=page_open 站点=quick-a.example 正文=304字
+14:23:21.596 判定命中：comment（page_dwell，站点 quick-a.example）
+14:23:21.707 派发模型请求：comment/page_dwell 站点=quick-a.example
+14:23:22.592 回复（comment/page_dwell，站点 quick-a.example）: …
+14:23:34.623 收到事件 #2 站点=quick-b.example → 14:23:34.631 派发（8ms，未被频控拦）
+```
+
+### 10.4 回归用例（本轮新增 6 条 + 修 2 条断言）
+
+`test_new_page_bypasses_page_cooldown`、`test_rate_limited_decision_is_remembered_and_retried`、
+`test_pending_decision_dropped_when_user_moved_on`、`test_event_arrival_wakes_idle_timer`、
+`test_pre_cue_bubble_shows_before_reply`、`test_limiter_floors_are_lowered_for_web_watch`；
+另修正 2 条因默认区间变化而失效的 clamp 断言（`cooldown_minutes` 0.1 地板、
+`min_request_interval_seconds` 10 地板）。
+
+### 10.5 仍未解决的瓶颈（如实登记）
+
+**模型往返的方差**是现在唯一的显著延迟：同一配置实测 0.86s ~ 19s，偶发 >36s 卡住。
+代码侧能做的只有"先兆气泡 + 快速失败"（已做）；再快只能从**服务商/模型**下手
+（「AI 与对话」里换更快的档位），或改成**流式**（首字到达即冒泡，估算把感知延迟压到
+1~2s 且不受总时长影响）——**未实现**，属下一步候选。
+
