@@ -101,6 +101,13 @@ class WebWatchService:
         class _Bridge(QObject):
             # (文本, 展示时长 ms)：worker 线程 emit → GUI 线程槽
             bubble_requested = Signal(str, int)
+            # (decision, 文本)：**同步进聊天会话必须走这里**。
+            # 实测缺陷（2026-10-06 卡死）：worker 线程直接调 on_look_synced →
+            # 在非 GUI 线程里改 Qt 聊天控件（chat/widgets.py 的 append_look_sync /
+            # _refresh_sessions）→ 死锁，GUI 线程停摆、窗口"未响应"，
+            # py-spy 栈里能看到 web-watch-requester 卡在 _refresh_sessions。
+            # 主动识屏的等价面是 proactive._on_reply_synced（明确标注"主线程槽"）。
+            sync_requested = Signal(object, str)
             # 事件到达（HTTP 线程 emit → GUI 线程立刻处理一次）：空闲时心跳退避到 5s，
             # 若等下一次心跳才处理，用户会明显感到"慢半拍"（实测最多白等 5s）
             event_arrived = Signal()
@@ -111,6 +118,9 @@ class WebWatchService:
 
             def _forward_bubble(self, text: str, duration_ms: int) -> None:
                 self._service._show_bubble(text, duration_ms)
+
+            def _forward_sync(self, decision: Any, text: str) -> None:
+                self._service._sync_to_chat(decision, text)
 
             def _forward_event_arrived(self) -> None:
                 self._service._on_event_arrived()
@@ -139,6 +149,7 @@ class WebWatchService:
         )
         self._bridge = _Bridge(self)
         self._bridge.bubble_requested.connect(self._bridge._forward_bubble)
+        self._bridge.sync_requested.connect(self._bridge._forward_sync)
         self._bridge.event_arrived.connect(self._bridge._forward_event_arrived)
         self._timer = QTimer()
         self._timer.setInterval(TICK_ACTIVE_MS)
@@ -701,7 +712,7 @@ class WebWatchService:
                 decision.digest.get("domain", ""),
                 text,
             )
-            self._sync_to_chat(decision, text)
+            self._sync_to_chat_async(decision, text)
         except EmptyReplyError as exc:
             # 空回复**不算故障**：模型有响应、只是没正文（多见于思考吃掉 tokens）。
             # 实测把它计入连续失败会让 3 次空回复就熔断掉一整天（见 PR 报告第十一节）。
@@ -758,8 +769,24 @@ class WebWatchService:
             except Exception:
                 log.debug("web_watch: 语音播报失败", exc_info=True)
 
+    def _sync_to_chat_async(self, decision: Decision, text: str) -> None:
+        """worker 线程调用：**只发信号**，真正的 UI 操作留给 GUI 线程。
+
+        绝不能在这里直接调 ``_sync_to_chat``：它会一路走到
+        ``chat/widgets.py::append_look_sync``/``_refresh_sessions`` 去改 Qt 控件，
+        在非 GUI 线程里做这件事会死锁（2026-10-06 实机卡死，py-spy 栈为证）。
+        """
+        try:
+            self._bridge.sync_requested.emit(decision, text)
+        except Exception:
+            log.debug("web_watch: 会话同步信号发送失败", exc_info=True)
+
     def _sync_to_chat(self, decision: Decision, text: str) -> None:
-        """把评论同步进 AI 对话会话（与主动识屏同一条通道）；标记不含标题。"""
+        """**只允许在 GUI 线程调用**：把评论同步进 AI 对话会话（与主动识屏同一条通道）。
+
+        线程约束与 ``proactive._on_reply_synced``（"主线程槽"）一致：
+        下游会操作聊天窗口控件，跨线程调用会死锁。
+        """
         callback = getattr(self.target, "on_look_synced", None)
         if not callable(callback):
             return

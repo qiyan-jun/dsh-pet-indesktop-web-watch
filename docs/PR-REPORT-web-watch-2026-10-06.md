@@ -364,3 +364,60 @@ web_watch_state.json = {"date":"2026-10-06","count":89,"consecutive_failures":3,
 - **调参要留安全边距**：把 `max_tokens` 从 512 压到 192 换来的延迟收益很小，
   却让推理模型开始产出空正文——实测数据（8 次空回复）比直觉可靠。
 
+## 十二、第五轮：整只桌宠卡死——跨线程操作聊天控件（2026-10-06 深夜）
+
+用户反馈「宠物现在卡死了」。**现场**：进程活着但 `Responding = False`（GUI 线程停摆）、
+无 ffmpeg 残留；日志里 HTTP 线程仍在收事件（收到 #70），但**从 22:12:20 起再没有一条
+GUI 线程的日志**（连 `tick 档位` 都没了）——即"接收正常、主线程死掉"。
+
+### 12.1 定位手段：py-spy 抓栈（决定性证据）
+
+`.venv` 里装了 `py-spy` 后 dump 卡死进程（栈存档：`.scratch/web-watch/hang-dump-2026-10-06.txt`）：
+
+```
+Thread 13556 (idle): "MainThread"
+    main (pet\app.py:3913)                     ← 只剩 Qt 事件循环，界面不响应
+
+Thread 23096 (idle): "web-watch-requester"     ← 我的 worker 线程
+    _refresh_sessions   (pet\chat\widgets.py:1580)   ← 正在改 Qt 聊天控件
+    append_look_sync    (pet\chat\widgets.py:1762)
+    sync_look_to_chat   (pet\app.py:1042)
+    on_look_synced      (pet\multi_window_shared.py:218)
+    _sync_to_chat       (pet\web_watch\service.py:769)
+    _worker_generate    (pet\web_watch\service.py:704)
+```
+
+### 12.2 根因
+
+`_worker_generate` 在**后台 worker 线程**里直接调用了 `self._sync_to_chat(...)`，
+它一路走到 `chat/widgets.py::append_look_sync` → `_refresh_sessions` 去**操作 Qt 控件**。
+Qt 控件只能在 GUI 线程动；跨线程操作在特定时序下会死锁，GUI 线程随即停摆，
+Windows 把窗口标成"未响应"——表现就是"整只桌宠卡死"。
+
+**这是我引入的缺陷**（不是上游的）：上游所有 `on_look_synced` 的调用者都在 GUI 线程
+（`proactive._on_reply_synced` 的 docstring 明确写着"**主线程槽**"、`window.py:3478`
+也在 GUI 线程）；`app._slot_wrap` 只设日志槽位、**不做线程转换**，所以那层包装救不了。
+触发条件带随机性（下游 `_refresh_sessions` 的时序），所以它是"跑了十几分钟才中一次"。
+
+### 12.3 修复
+
+| # | 改动 |
+| --- | --- |
+| 1 | `_Bridge` 新增 `sync_requested = Signal(object, str)`，worker 线程只 `emit`（与既有的 `bubble_requested` 同一模式） |
+| 2 | 新增 `_sync_to_chat_async`（worker 侧，只发信号）与 GUI 侧槽 `_sync_to_chat`，并在 docstring 写明"**只允许在 GUI 线程调用**"，与 `proactive._on_reply_synced` 对齐 |
+| 3 | 回归用例 `test_chat_sync_happens_on_gui_thread`：断言 `on_look_synced` 回调发生在 `MainThread`（修复前它在 `web-watch-requester` 上执行） |
+
+### 12.4 实机处置
+
+- 先把栈 dump 存档，再强杀卡死进程并重启：新进程 **Responding=True**，功能正常；
+- 修复后聚焦族 **145 passed**、`ruff` 全绿；部署后连续触发多次评论，`Responding` 保持 `True`。
+
+### 12.5 教训
+
+- **跨线程边界要用"信号 + GUI 槽"固定下来**，不能靠"看起来只是加一条消息"；
+  凡是会碰 UI 的回调，调用点必须能一眼看出线程约束（docstring 写死 + 用例钉住）；
+- **卡死要有取证手段**：这次若没有 `py-spy dump`，只能靠日志猜（"接收正常但主线程没动静"
+  已经是很强的线索，但定不到那一行）。建议把"卡死抓栈"列进排障清单；
+- **上游的正确写法就在旁边**（`proactive._on_reply_synced` 写着"主线程槽"）——
+  新代码走同一通道时，先照抄它的线程模型，再谈复用。
+

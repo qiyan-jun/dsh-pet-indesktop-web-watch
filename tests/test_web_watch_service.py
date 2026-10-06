@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -807,6 +808,30 @@ def test_state_file_with_bom_is_not_treated_as_corrupt(tmp_path):
     path.write_text('\ufeff{"date": "2026-10-06", "count": 42}', encoding="utf-8")
     lim = ProactiveLimiter(path, {"daily_cap": 100}, clock=lambda: 1_000_000.0, today=lambda: "2026-10-06")
     assert lim._load_state()["count"] == 42, "BOM 不该让计数归零"
+
+
+def test_chat_sync_happens_on_gui_thread(tmp_path, monkeypatch):
+    """聊天同步必须在 **GUI 线程** 执行。
+
+    实测缺陷（2026-10-06 实机卡死）：worker 线程直接调 ``on_look_synced`` →
+    一路走到 ``chat/widgets.py::append_look_sync``/``_refresh_sessions`` 去改 Qt 控件
+    → 死锁，GUI 线程停摆、窗口"未响应"（py-spy 栈：web-watch-requester 卡在
+    _refresh_sessions）。修法是照主动识屏的做法，用信号把同步交给 GUI 线程。
+    """
+    monkeypatch.setattr(service_mod, "post_text_request", lambda *_a, **_k: "一句评论")
+    service, fake, _cfg = _service(
+        tmp_path, enabled=True, port=0, dwell_seconds=0, min_text_chars=10, pre_cue=False
+    )
+    seen: list[str] = []
+    fake.on_look_synced = lambda marker, reply: seen.append(threading.current_thread().name)
+    try:
+        assert _post_to(service, _page())[0] == 204
+        assert _wait_until(lambda: bool(seen), timeout=10.0), "同步没有发生"
+        assert seen[0] == "MainThread", (
+            f"同步发生在 {seen[0]} —— 非 GUI 线程里操作聊天控件会死锁整个桌宠"
+        )
+    finally:
+        service.stop()
 
 
 # ---------------------------------------------------------------- 设置页契约
