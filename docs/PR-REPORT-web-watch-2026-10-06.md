@@ -31,60 +31,62 @@
 
 ## 二、修改文件说明
 
-（`git diff --numstat`，含新增文件行数）
+`git diff --numstat e4af6a8 HEAD`（提交 `f58ad50`；29 个文件：实现 13、浏览器扩展集成 8、测试 5、文档 2、工具 1）。
 
-### 实现
+### 实现（13）
 
 | 文件 | 增/删 | 改了什么 + 为什么 |
 | --- | --- | --- |
-| `pet/web_watch/__init__.py` | +11 | 新包入口与分层说明（零 re-export，避免 F401） |
-| `pet/web_watch/protocol.py` | +103 | 事件协议与**唯一一次**输入校验/裁剪：非法 kind、非 http(s)、超长字段、NaN 数值一律降级；URL 查询串/锚点在此丢弃 |
-| `pet/web_watch/digest.py` | +139 | 隐私摘要：域名归一、`fnmatch` 黑/白名单（子域自动命中）、内容哈希、正文截断、页面分类（视频/代码/论文/购物/问答/新闻/文档） |
-| `pet/web_watch/policy.py` | +333 | 触发状态机：停留/增量/划词/视频时刻/发呆建议 + 页级去重 + 闸门（可见/全屏/闲置/agent 忙）+ 被拦下时的状态保留与划词待补说 |
-| `pet/web_watch/prompts.py` | +104 | 两条提示词（评论/建议）+ 紧凑页面段落 + `<SKIP>` 弃权 + 输出清洗（去包装、取首行、截断） |
-| `pet/web_watch/llm.py` | +107 | 非流式短文本请求（仿 `vision._post_vision_request`）：重试/429 退避/超时下限/预算钩子；顶层不 import `pet.chat`（无 Chat 变体安全） |
-| `pet/web_watch/server.py` | +197 | 本地回环接收端：令牌常量时间比较、`Content-Length` 上限 413、非法 JSON/事件 400、`/health` 与 `/ping`、**不打印页面内容** |
-| `pet/web_watch/service.py` | +404 | Qt 侧装配：信号桥 → GUI 线程心跳（有页 1s / 空闲 5s 退避）→ 频控 → daemon 线程生成 → 代理冒泡（+TTS/会话同步）；代次令牌作废迟到结果 |
-| `pet/settings_web_watch.py` | +262 | 设置页控件/行/保存/自检（复制令牌、测试连接、打开扩展目录、今日用量）；放在独立模块（`modern_settings_dialog.py` 行数预算已顶格，与 `settings_file_interpret` 同法） |
-| `pet/config.py` | +108/-0 | 新域 `web_watch`：默认值、`_merge_web_watch_data`、加载合并、脏值归一化（布尔/数值/名单）、`set()` 重归一化触发、域入口 |
+| `pet/web_watch/__init__.py` | +16 | 新包入口与分层说明（零 re-export，避免 F401） |
+| `pet/web_watch/protocol.py` | +130 | 事件协议与**唯一一次**输入校验/裁剪：非法 kind、非 http(s)、超长字段、NaN 数值一律降级；URL 查询串/锚点在此丢弃 |
+| `pet/web_watch/digest.py` | +173 | 隐私摘要：域名归一、`fnmatch` 黑/白名单（子域自动命中）、内容哈希、正文截断、页面分类（视频/代码/论文/购物/问答/新闻/文档） |
+| `pet/web_watch/policy.py` | +444 | 触发状态机：停留/增量/划词/视频时刻/发呆建议 + 页级去重 + 闸门（可见/全屏/闲置/agent 忙，后者默认不拦）+ **被拦下时仍记页身份与待补说划词** |
+| `pet/web_watch/prompts.py` | +123 | 两条提示词（评论/建议）+ 紧凑页面段落 + `<SKIP>` 弃权 + 输出清洗（去引号/markdown、取首行、截断） |
+| `pet/web_watch/llm.py` | +129 | 非流式短文本请求（仿 `vision._post_vision_request`）：重试 / 429 退避 / 超时下限 60s / 每次真实请求前扣预算；顶层不 import `pet.chat`（无 Chat 变体安全） |
+| `pet/web_watch/server.py` | +239 | 本地回环接收端：令牌常量时间比较、`Content-Length` 上限 413、非法 JSON/事件 400、`/health`+`/ping`、**不打印页面内容** |
+| `pet/web_watch/service.py` | +458 | Qt 侧装配：信号桥 → GUI 线程心跳（有页 1s / 空闲 5s 退避）→ 频控 → daemon 线程生成 → 代理冒泡（+TTS/会话同步）；代次令牌作废迟到结果；频控拒绝后 10s 本地退避 |
+| `pet/settings_web_watch.py` | +317 | 设置页控件/行/保存/自检（复制令牌、测试连接、打开扩展目录、今日用量）。放独立模块：`modern_settings_dialog.py` 行数预算已顶格（与 `settings_file_interpret` 同法） |
+| `pet/config.py` | +108 | 新域 `web_watch`：默认值（28 键，含 `pause_when_agent_busy`）、`_merge_web_watch_data`、加载合并、脏值归一化（布尔/数值/名单）、`set()` 重归一化触发 |
 | `pet/config_domains.py` | +15 | `WebWatchConfig` facade（复用 `_merge_web_watch_data`，不写第二份清洗逻辑） |
-| `pet/app.py` | +79/-0 | 懒门控三件套（`_web_watch_wanted/_ensure/_sync`）+ 启动装配 + 退出收口 + **热加载路径同步**（独立设置进程保存后立即启停）+ 测试收口 + 防御式读 `config` |
-| `pet/modern_settings_dialog.py` | +10/-0 | 四处最小接线：import、控件安装调用、「网页互动」组、保存委托 |
+| `pet/app.py` | +77 | 懒门控三件套（`_web_watch_wanted/_ensure/_sync`）+ 启动装配 + 退出收口 + **热加载路径同步** + 测试收口 + 防御式读 `config`（`AppShell.__new__` 造壳不得炸） |
+| `pet/modern_settings_dialog.py` | +10 | 四处最小接线：import、控件安装调用、「网页互动」组、保存委托 |
 
-### 测试
+### 测试（5）
 
 | 文件 | 增/删 | 说明 |
 | --- | --- | --- |
-| `tests/test_web_watch.py` | +262 | 纯逻辑契约 41 例：协议/隐私摘要/名单/五类触发/闸门/待补说/状态回滚/快照不泄密/默认值同步 |
-| `tests/test_web_watch_service.py` | +446 | 服务与接线 22 例：真回环 HTTP（204/401/400/413/health）、端到端触发→冒泡、dry-run 不调模型、频控退避、AppShell 懒门控、热加载同步、设置页 round-trip |
+| `tests/test_web_watch.py` | +368 | 纯逻辑契约 41 例：协议裁剪/隐私摘要/名单匹配/五类触发/闸门/待补说/状态回滚/快照不泄密/默认值同步 |
+| `tests/test_web_watch_service.py` | +517 | 服务与接线 22 例：真回环 HTTP（204/401/400/413/health）、端到端触发→冒泡、dry-run 不调模型、频控退避、AppShell 懒门控、热加载同步、设置页 round-trip |
 | `tests/test_app_lazy_imports.py` | +19/-1 | 守卫：`import pet.app` 不得带出 `pet.web_watch.*`（关闭即零开销） |
-| `tests/test_architecture.py` | +6/-1 | 行数预算 2393 → 2403（+10 行接线，带日期与理由） |
+| `tests/test_architecture.py` | +6/-1 | 行数预算 2393 → 2403（+10 行接线，带日期与理由注释） |
 | `tests/test_config_schema.py` | +2/-1 | `web_watch` 登记进 `SPECIAL_CASED_KEYS`（嵌套 dict 走专门合并路径） |
 
-### 集成（浏览器扩展，随包分发到 `_internal/integrations/`）
+### 浏览器扩展集成（8，随包分发到 `_internal/integrations/`）
 
 | 文件 | 增 | 说明 |
 | --- | --- | --- |
-| `integrations/edge-web-watch/manifest.json` | +24 | MV3；`host_permissions` 仅 `http://127.0.0.1/*` |
-| `integrations/edge-web-watch/content.js` | +158 | 采集：正文（article/main 优先）、小标题、划词、视频进度、DOM 变化去抖；**无任何读输入框值的路径**；含密码框整体停发 |
-| `integrations/edge-web-watch/background.js` | +107 | 队列串行 POST + 状态（401/离线/拒绝）+ 角标提示 |
-| `integrations/edge-web-watch/{options,popup}.html/.js` | +184 | 端口/令牌/域名暂停/自检；「让桌宠现在看看这页」 |
-| `integrations/edge-web-watch/README.md` | +36 | 安装三步、触发时机表、隐私边界、排查表 |
+| `integrations/edge-web-watch/manifest.json` | +24 | MV3；`host_permissions` 仅 `http://127.0.0.1/*`；options + popup |
+| `integrations/edge-web-watch/content.js` | +184 | 采集：正文（article/main 优先）、小标题、划词、视频进度、DOM 变化去抖；**无任何读输入框值的路径**；含密码框整体停发 |
+| `integrations/edge-web-watch/background.js` | +121 | 队列串行 POST + 状态（401/离线/被拒）+ 角标提示 |
+| `integrations/edge-web-watch/options.{html,js}` | +56 / +76 | 端口/令牌/开关/域名暂停名单/测试连接 |
+| `integrations/edge-web-watch/popup.{html,js}` | +24 / +54 | 连接状态、本网站暂停、「让桌宠现在看看这页」 |
+| `integrations/edge-web-watch/README.md` | +59 | 安装三步、触发时机表、隐私边界、排查表 |
 
-### 文档
+### 文档与工具（3）
 
-| 文件 | 说明 |
-| --- | --- |
-| `docs/PR-REPORT-web-watch-2026-10-06.md` | 本报告 |
-| `docs/INDEX.md` | 「PR 报告存档」登记一行 |
-| `.scratch/web-watch/{spec.md,HANDOFF.md,measure.py}` | 设计记录 / 断点 / 性能实测脚本（`.scratch/` 按仓库约定不进提交） |
+| 文件 | 增/删 | 说明 |
+| --- | --- | --- |
+| `docs/PR-REPORT-web-watch-2026-10-06.md` | +169 | 本报告 |
+| `docs/INDEX.md` | +1 | 「PR 报告存档」登记一行 |
+| `.gitignore` | +1 | 加 `.venv/`（本次开发在仓库内建 venv；`pytest.ini` 的 `norecursedirs` 早已预期该目录） |
 
 ### 未改动（刻意）
 
 - `pet/proactive.py`、`pet/proactive_limiter.py`（只调用，不改语义）；
 - `pet/edge_probe.py` / `sprite_edge_probe.py`（与浏览器无关的边缘探头）；
 - `pet/multi_window_shared.py`（冒泡直接复用既有 proxy，未加方法）；
-- `PET_RENDER_TOPOLOGY` 两条拓扑的渲染壳。
+- 两条渲染拓扑的壳（`window.py` / `overlay_shell.py` / `pet_sprite.py`）；
+- `.scratch/web-watch/{spec.md,HANDOFF.md,measure.py}` 按仓库约定不入库。
 
 ## 三、实现要点
 
@@ -133,6 +135,11 @@
    ——既命中页面里的具体数字，也注意到测试文本的重复。
 7. **真实评论（划词触发）**：发 `selection`（选中"作者实测 60fps 下 CPU 占用约 8%…"）→ 日志
    `web_watch 回复（comment/selection，站点 zhuanlan.zhihu.com）: 8% CPU换60fps这性能优化可以啊`（正面评论被选中的那段）。
+7b. **真实建议（发呆触发）**：在少数派文章页停留后（未勾"仅闲置时触发"，`suggest_idle_seconds=45` 由系统闲置满足）→ 日志
+   `web_watch 回复（suggest/page_idle_suggestion，站点 sspai.com）: 建议收藏这篇文章并添加标签，便于后续按主题检索复习`
+   ——这是"有时给建议"这条需求在实机的正面证据；建议内容针对页面类型（资讯/文章）而非泛泛而谈。
+7c. **真实 TTS（朗读）**：把 `web_watch.speak_enabled` 置真后触发评论，`voice_chime_cache` 目录出现新 mp3 `485327a6c9c40c5e.mp3`（37 008 B，11:46:01，晚于回复 4 秒）；用同一音色配置对同一条评论文本复算 `pet/voice_chime.cache_key()` 得 `485327a6c9c40c5e`，**键完全一致** → 该 mp3 就是这条评论的 edge-tts 合成产物，朗读链路端到端成立（我没有"听"这一环，故用缓存键相关性作为证据，不推断音量/音质）。
+7d. **模型弃权路径**：11:42 的划词请求在飞了约 3 分钟后没有冒泡，`web_watch_state.json` 的 `consecutive_failures` 仍为 0 —— 属 `<SKIP>` 弃权（设计如此：宁可不说话也不硬凑）；同页 3 分钟后按"发呆建议"正常出声，说明不是链路故障。
 8. **第二条真缺口（本次实机最重要的发现）**：发新页事件后**完全没反应**。排查：`/health` 200（接收端在跑）、`POST` 204（事件收下了）、状态文件停在上一轮。根因是守卫在"记录页身份"**之前**返回——DSH agent（就是我）在工作时 `agent_busy=True`，事件被整条丢弃，页面根本没被记住，等 agent 空闲也不会再评论它。两处修正：① `observe` 先记状态再问闸门；② `agent_busy` 默认**不再静音**（新增配置 `pause_when_agent_busy`，默认 false），因为 agent 在对话期间几乎恒为 working。新增用例 `test_blocked_gate_still_records_page_so_it_can_speak_later`、`test_pending_selection_is_delivered_after_gate_clears`、`test_agent_busy_does_not_silence_by_default`。
 9. **设置页实机验收**：`exe --settings`（用户真实流程：独立设置进程）正常起窗，页脚显示 `版本 v4.2.1`（确认部署产物与源码同版本）；`--settings --settings-page 自动化与联动` 可直接定位到承载新组的域（截图 `.scratch/web-watch/settings.png`、`settings-webwatch.png`）。**未取到该组滚动后的截图**：我用 `SendKeys` 发 PGDN 未生效（设置窗未接收），故"新组在页面上长什么样"只有控件契约用例与域页可打开两项证据，没有像素证据——如实登记，不推断。
 10. **用户可见行为确认（气泡像素证据）**：发 `page_open`（arxiv 摘要页）后截图 `.scratch/web-watch/bubble-win-2.png` 中，桌宠头顶气泡正是该条评论全文「这结果复制粘贴了五次，作者写论文写到打瞌睡了吧」，与日志同一句。
@@ -144,7 +151,7 @@
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 静态检查 | `python -m ruff check pet tests scripts` | 新增/改动文件全绿；`pet/window.py` 有 4 个 **上游既有** F811（该文件与基线提交逐字节相同，`git diff --stat` 为空，与本改动无关） |
+| 静态检查 | `python -m ruff check pet tests scripts` | **All checks passed**（venv 的 ruff 0.16.10，全仓库无违规）。附注：用本机 conda 里较旧的 ruff 0.12.0 跑会报 `pet/window.py` 4 个 F811——该文件与基线提交逐字节相同（`git diff --stat` 为空），属上游既有、与本改动无关 |
 | 聚焦（纯逻辑） | `pytest tests/test_web_watch.py -q` | 41 passed |
 | 聚焦（服务/接线/设置页） | `pytest tests/test_web_watch_service.py -q` | 22 passed |
 | 配置与架构门 | `pytest tests/test_config_schema.py tests/test_config_domains.py tests/test_architecture.py tests/test_app_lazy_imports.py -q` | 全绿 |
